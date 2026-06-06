@@ -1,0 +1,2 @@
+dirigera==1.2.7
+prometheus-client==0.25.0

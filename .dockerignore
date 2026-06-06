@@ -1,0 +1,14 @@
+.git
+.github
+tests
+*.md
+.gitignore
+.dockerignore
+requirements-dev.txt
+renovate.json
+**/__pycache__
+*.pyc
+.venv
+venv
+.ruff_cache
+.pytest_cache
