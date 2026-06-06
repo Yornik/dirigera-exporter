@@ -83,6 +83,7 @@ def _reset_metrics():
         ex.PURIFIER_MOTOR_SPEED,
         ex.PURIFIER_FAN_MODE,
         ex.PURIFIER_FILTER_ALARM,
+        ex.PURIFIER_PM25,
     ):
         gauge.clear()
     ex.SCRAPE_SUCCESS.set(0)
@@ -166,8 +167,9 @@ def test_air_purifier_metrics():
     assert value("ikea_air_purifier_running", **labels) == 1
     assert value("ikea_air_purifier_motor_speed", **labels) == 20
     assert value("ikea_air_purifier_filter_alarm", **labels) == 0
-    # The purifier's own PM2.5 is published on the shared metric.
-    assert value("ikea_air_pm25_micrograms_per_cubic_meter", **labels) == 12
+    # The purifier's PM2.5 goes on its own metric, never the env-sensor µg/m³ one.
+    assert value("ikea_air_purifier_pm25", **labels) == 12
+    assert value("ikea_air_pm25_micrograms_per_cubic_meter", **labels) is None
     # Active fan mode is 1, every other mode is 0.
     assert (
         value("ikea_air_purifier_fan_mode", sensor="STARKVIND", room="Living room", mode="auto")
