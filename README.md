@@ -18,11 +18,12 @@ environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA**) and the state of every
 | `ikea_air_temperature_celsius` | `sensor`, `room` | Temperature in °C (`TEMP_OFFSET_CELSIUS` applied) |
 | `ikea_air_humidity_percent` | `sensor`, `room` | Relative humidity in % |
 | `ikea_air_co2_ppm` | `sensor`, `room` | CO₂ in ppm |
-| `ikea_air_pm25_micrograms_per_cubic_meter` | `sensor`, `room` | PM2.5 in µg/m³ (environment sensors **and** air purifiers) |
+| `ikea_air_pm25_micrograms_per_cubic_meter` | `sensor`, `room` | PM2.5 in µg/m³ (environment sensors) |
 | `ikea_air_purifier_running` | `sensor`, `room` | `1` if the STARKVIND motor is running, else `0` |
 | `ikea_air_purifier_motor_speed` | `sensor`, `room` | Motor speed (0–50; `0` = off) |
 | `ikea_air_purifier_fan_mode` | `sensor`, `room`, `mode` | `1` for the active fan mode (`off`/`on`/`low`/`medium`/`high`/`auto`), else `0` |
 | `ikea_air_purifier_filter_alarm` | `sensor`, `room` | `1` if the filter needs attention/replacement |
+| `ikea_air_purifier_pm25` | `sensor`, `room` | Air purifier's raw PM2.5 reading — **not** comparable to the µg/m³ metric (the STARKVIND samples only with airflow, so it can be stale/coarse) |
 | `ikea_dirigera_scrape_success` | — | `1` if the most recent hub poll succeeded, else `0` |
 | `ikea_dirigera_last_success_timestamp_seconds` | — | Unix time of the most recent successful poll |
 
@@ -57,7 +58,7 @@ generate-token <HUB_IP>
 docker run --rm -p 9119:9119 \
   -e DIRIGERA_IP=192.168.1.62 \
   -e DIRIGERA_TOKEN="$DIRIGERA_TOKEN" \
-  ghcr.io/yornik/dirigera-exporter:v0.1.0
+  ghcr.io/yornik/dirigera-exporter:v0.2.0
 
 curl -s localhost:9119/metrics | grep ikea_
 ```

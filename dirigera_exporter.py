@@ -52,7 +52,7 @@ CO2 = Gauge(
 )
 PM25 = Gauge(
     "ikea_air_pm25_micrograms_per_cubic_meter",
-    "PM2.5 concentration in micrograms per cubic meter (sensors and purifiers).",
+    "PM2.5 concentration in micrograms per cubic meter (environment sensors).",
     _LABELS,
 )
 
@@ -75,6 +75,13 @@ PURIFIER_FAN_MODE = Gauge(
 PURIFIER_FILTER_ALARM = Gauge(
     "ikea_air_purifier_filter_alarm",
     "1 if the air purifier filter needs attention/replacement, 0 otherwise.",
+    _LABELS,
+)
+PURIFIER_PM25 = Gauge(
+    "ikea_air_purifier_pm25",
+    "Raw PM2.5 reading from the air purifier's built-in sensor. NOT directly "
+    "comparable to ikea_air_pm25_micrograms_per_cubic_meter: the STARKVIND only "
+    "samples when air flows through it, so the value can be stale or coarse.",
     _LABELS,
 )
 
@@ -157,9 +164,11 @@ def update_air_purifier_metrics(purifier: AirPurifier) -> None:
             1 if mode.value == current_mode else 0
         )
 
-    # The STARKVIND has its own PM2.5 sensor; surface it on the shared metric.
+    # The STARKVIND's PM2.5 is NOT comparable to the environment sensors' µg/m³
+    # (it samples only with airflow, so it reads stale/coarse). Publish it on its
+    # own metric, never on the shared environment-sensor metric.
     if attrs.current_p_m25 is not None:
-        PM25.labels(**labels).set(attrs.current_p_m25)
+        PURIFIER_PM25.labels(**labels).set(attrs.current_p_m25)
 
 
 def poll_once(hub: Hub, temp_offset: float) -> int | None:
