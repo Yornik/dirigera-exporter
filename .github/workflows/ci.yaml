@@ -76,7 +76,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/dirigera-exporter:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/dirigera-exporter:latest
+            ghcr.io/yornik/dirigera-exporter:${{ github.ref_name }}
+            ghcr.io/yornik/dirigera-exporter:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
