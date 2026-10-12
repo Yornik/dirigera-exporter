@@ -1,2 +1,2 @@
-dirigera==1.2.7
+dirigera==1.4.1
 prometheus-client==0.25.0
