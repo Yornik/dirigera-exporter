@@ -10,8 +10,13 @@ Polls a DIRIGERA hub's local HTTPS API on a fixed interval and exposes:
 
 Configuration is via environment variables only; no secrets are baked into the
 image. The exporter is designed to never crash on hub/network errors: a failed
-poll sets ``ikea_dirigera_scrape_success`` to 0, logs the error, and keeps
-serving the last-known values.
+poll sets ``ikea_dirigera_scrape_success`` to 0 and logs the error. The last
+values stay up for up to 3 poll intervals, then the device series are removed,
+so a dashboard never shows an old reading as current.
+
+Each successful poll publishes exactly what it saw. A reading the hub does not
+send, a device it cannot reach, and a renamed or removed device all drop out
+instead of keeping their last value.
 """
 
 from __future__ import annotations
@@ -24,8 +29,8 @@ import warnings
 
 import urllib3
 from dirigera import Hub
-from dirigera.devices.air_purifier import AirPurifier, FanModeEnum
-from dirigera.devices.environment_sensor import EnvironmentSensor
+from dirigera.devices.air_purifier import AirPurifier, FanModeEnum, dict_to_air_purifier
+from dirigera.devices.environment_sensor import EnvironmentSensor, dict_to_environment_sensor
 from prometheus_client import Gauge, start_http_server
 
 LOG = logging.getLogger("dirigera-exporter")
@@ -85,6 +90,34 @@ PURIFIER_PM25 = Gauge(
     _LABELS,
 )
 
+# --- per-device health, for environment sensors and air purifiers ---
+DEVICE_REACHABLE = Gauge(
+    "ikea_dirigera_device_reachable",
+    "1 if the hub can reach the device, 0 if not. An unreachable device publishes no readings.",
+    _LABELS,
+)
+DEVICE_LAST_SEEN = Gauge(
+    "ikea_dirigera_device_last_seen_timestamp_seconds",
+    "Unix time the hub last heard from the device.",
+    _LABELS,
+)
+
+# Every gauge with per-device series. publish() keeps each of them equal to the
+# latest poll.
+DEVICE_GAUGES = (
+    TEMPERATURE,
+    HUMIDITY,
+    CO2,
+    PM25,
+    PURIFIER_RUNNING,
+    PURIFIER_MOTOR_SPEED,
+    PURIFIER_FAN_MODE,
+    PURIFIER_FILTER_ALARM,
+    PURIFIER_PM25,
+    DEVICE_REACHABLE,
+    DEVICE_LAST_SEEN,
+)
+
 # --- global scrape-health gauges (no labels) ---
 SCRAPE_SUCCESS = Gauge(
     "ikea_dirigera_scrape_success",
@@ -128,80 +161,172 @@ def room_name(device) -> str:
     return name or "unknown"
 
 
-def update_sensor_metrics(sensor: EnvironmentSensor, temp_offset: float) -> None:
-    """Map one environment sensor's readings onto the gauges.
+# One poll's readings: gauge -> label values -> value.
+Samples = dict[Gauge, dict[tuple[str, ...], float]]
+
+
+class _State:
+    """What the exporter has published, and when the hub last answered."""
+
+    def __init__(self) -> None:
+        self.published: dict[Gauge, set[tuple[str, ...]]] = {g: set() for g in DEVICE_GAUGES}
+        self.last_success = 0.0
+
+
+STATE = _State()
+
+
+def publish(samples: Samples) -> None:
+    """Make every device gauge show exactly ``samples``.
+
+    A label set that is not in ``samples`` is removed. A prometheus_client gauge
+    otherwise keeps its last value for ever, so a reading that stops arriving
+    would look current.
+    """
+    for gauge in DEVICE_GAUGES:
+        new = samples.get(gauge, {})
+        for labels in STATE.published[gauge] - new.keys():
+            gauge.remove(*labels)
+        for labels, val in new.items():
+            gauge.labels(*labels).set(val)
+        STATE.published[gauge] = set(new)
+
+
+def _add(samples: Samples, gauge: Gauge, labels: tuple[str, ...], val: float) -> None:
+    samples.setdefault(gauge, {})[labels] = val
+
+
+def _health_samples(device, samples: Samples) -> bool:
+    """Add reachability and last-seen; return True if the device is reachable."""
+    labels = (device_name(device), room_name(device))
+    reachable = bool(getattr(device, "is_reachable", True))
+    _add(samples, DEVICE_REACHABLE, labels, 1 if reachable else 0)
+    last_seen = getattr(device, "last_seen", None)
+    if last_seen is not None:
+        _add(samples, DEVICE_LAST_SEEN, labels, last_seen.timestamp())
+    return reachable
+
+
+def sensor_samples(sensor: EnvironmentSensor, temp_offset: float, samples: Samples) -> None:
+    """Add one environment sensor's valid readings to ``samples``.
 
     Only fields the sensor actually reports are emitted, so a sensor that lacks
     a CO2 or PM2.5 channel does not publish a misleading ``0``.
     """
+    if not _health_samples(sensor, samples):
+        return
     attrs = sensor.attributes
-    labels = {"sensor": device_name(sensor), "room": room_name(sensor)}
+    labels = (device_name(sensor), room_name(sensor))
 
+    # When a sensor drops out, the hub reports 0 for every reading (seen for 23 h
+    # on 2026-09-14). 0 % humidity cannot happen indoors, so it marks the whole
+    # set as invalid. A PM2.5 of 0 is real clean air and cannot mark anything.
+    if attrs.current_r_h == 0:
+        return
     if attrs.current_temperature is not None:
-        TEMPERATURE.labels(**labels).set(attrs.current_temperature + temp_offset)
+        # The offset goes on a valid reading only, never on a dropout.
+        _add(samples, TEMPERATURE, labels, attrs.current_temperature + temp_offset)
     if attrs.current_r_h is not None:
-        HUMIDITY.labels(**labels).set(attrs.current_r_h)
-    if attrs.current_c_o2 is not None:
-        CO2.labels(**labels).set(attrs.current_c_o2)
+        _add(samples, HUMIDITY, labels, attrs.current_r_h)
+    # 0 ppm CO2 cannot happen either: outdoor air has about 420 ppm.
+    if attrs.current_c_o2:
+        _add(samples, CO2, labels, attrs.current_c_o2)
     if attrs.current_p_m25 is not None:
-        PM25.labels(**labels).set(attrs.current_p_m25)
+        _add(samples, PM25, labels, attrs.current_p_m25)
 
 
-def update_air_purifier_metrics(purifier: AirPurifier) -> None:
-    """Map one STARKVIND air purifier's state onto the gauges."""
+def purifier_samples(purifier: AirPurifier, samples: Samples) -> None:
+    """Add one STARKVIND air purifier's state to ``samples``."""
+    if not _health_samples(purifier, samples):
+        return
     attrs = purifier.attributes
-    labels = {"sensor": device_name(purifier), "room": room_name(purifier)}
+    labels = (device_name(purifier), room_name(purifier))
 
-    PURIFIER_MOTOR_SPEED.labels(**labels).set(attrs.motor_state)
-    PURIFIER_RUNNING.labels(**labels).set(1 if attrs.motor_state > 0 else 0)
-    PURIFIER_FILTER_ALARM.labels(**labels).set(1 if attrs.filter_alarm_status else 0)
+    _add(samples, PURIFIER_MOTOR_SPEED, labels, attrs.motor_state)
+    _add(samples, PURIFIER_RUNNING, labels, 1 if attrs.motor_state > 0 else 0)
+    _add(samples, PURIFIER_FILTER_ALARM, labels, 1 if attrs.filter_alarm_status else 0)
 
     # Enum-as-gauge: set the active mode to 1 and every other mode to 0 so a
     # mode change is reflected immediately without leaving stale series.
     current_mode = getattr(attrs.fan_mode, "value", str(attrs.fan_mode))
     for mode in FanModeEnum:
-        PURIFIER_FAN_MODE.labels(sensor=labels["sensor"], room=labels["room"], mode=mode.value).set(
-            1 if mode.value == current_mode else 0
+        _add(
+            samples,
+            PURIFIER_FAN_MODE,
+            (*labels, mode.value),
+            1 if mode.value == current_mode else 0,
         )
 
     # The STARKVIND's PM2.5 is NOT comparable to the environment sensors' µg/m³
     # (it samples only with airflow, so it reads stale/coarse). Publish it on its
     # own metric, never on the shared environment-sensor metric.
     if attrs.current_p_m25 is not None:
-        PURIFIER_PM25.labels(**labels).set(attrs.current_p_m25)
+        _add(samples, PURIFIER_PM25, labels, attrs.current_p_m25)
 
 
-def poll_once(hub: Hub, temp_offset: float) -> int | None:
+def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | None:
     """Poll the hub once.
 
     Returns the number of devices scraped on success, or ``None`` on failure.
-    Never raises: any error is recorded as ``scrape_success=0`` and logged.
+    Never raises: any error is recorded as ``scrape_success=0`` and logged. After
+    a failure, the last values stay up until ``stale_after`` seconds have passed
+    since the last successful poll; then the device series are removed.
     """
     try:
-        sensors = hub.get_environment_sensors()
-        for sensor in sensors:
-            update_sensor_metrics(sensor, temp_offset)
-        purifiers = hub.get_air_purifiers()
-        for purifier in purifiers:
-            update_air_purifier_metrics(purifier)
+        # One request for all devices. The library's get_environment_sensors()
+        # and get_air_purifiers() each fetch /devices and parse the whole list,
+        # so one malformed device would fail the poll for every device.
+        devices = hub.get("/devices")
     except Exception as exc:  # noqa: BLE001 - the exporter must survive any hub error
         SCRAPE_SUCCESS.set(0)
         LOG.error("failed to poll DIRIGERA hub: %s", exc)
+        if time.time() - STATE.last_success > stale_after:
+            publish({})
         return None
 
+    samples: Samples = {}
+    sensors = purifiers = skipped = 0
+    for raw in devices:
+        if raw.get("deviceType") == "environmentSensor":
+            kind = "sensor"
+        elif raw.get("type") == "airPurifier":
+            kind = "purifier"
+        else:
+            continue
+        own: Samples = {}
+        try:
+            if kind == "sensor":
+                sensor_samples(dict_to_environment_sensor(raw, hub), temp_offset, own)
+            else:
+                purifier_samples(dict_to_air_purifier(raw, hub), own)
+        except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
+            skipped += 1
+            LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
+            continue
+        for gauge, series in own.items():
+            samples.setdefault(gauge, {}).update(series)
+        if kind == "sensor":
+            sensors += 1
+        else:
+            purifiers += 1
+
+    publish(samples)
+    now = time.time()
+    STATE.last_success = now
     SCRAPE_SUCCESS.set(1)
-    LAST_SUCCESS.set(time.time())
+    LAST_SUCCESS.set(now)
     LOG.info(
-        "polled %d environment sensor(s) and %d air purifier(s)",
-        len(sensors),
-        len(purifiers),
+        "polled %d environment sensor(s) and %d air purifier(s)%s",
+        sensors,
+        purifiers,
+        f", skipped {skipped}" if skipped else "",
     )
-    return len(sensors) + len(purifiers)
+    return sensors + purifiers
 
 
 def run(hub: Hub, config: Config) -> None:  # pragma: no cover - infinite loop
     while True:
-        poll_once(hub, config.temp_offset)
+        poll_once(hub, config.temp_offset, stale_after=3 * config.poll_interval)
         time.sleep(config.poll_interval)
 
 
