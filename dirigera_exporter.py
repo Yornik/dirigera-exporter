@@ -139,6 +139,11 @@ class Config:
         self.temp_offset = float(os.environ.get("TEMP_OFFSET_CELSIUS", "0.0"))
         self.listen_port = int(os.environ.get("LISTEN_PORT", "9119"))
 
+    @property
+    def stale_after(self) -> float:
+        """Seconds without a successful poll before the device series are removed."""
+        return 3 * self.poll_interval
+
     def validate(self) -> None:
         missing = [
             name
@@ -170,7 +175,9 @@ class _State:
 
     def __init__(self) -> None:
         self.published: dict[Gauge, set[tuple[str, ...]]] = {g: set() for g in DEVICE_GAUGES}
-        self.last_success = 0.0
+        # time.monotonic() of the last successful poll, so a wall-clock step
+        # (NTP, a VM resume) cannot make the values look fresh or stale.
+        self.last_success: float | None = None
 
 
 STATE = _State()
@@ -193,7 +200,24 @@ def publish(samples: Samples) -> None:
 
 
 def _add(samples: Samples, gauge: Gauge, labels: tuple[str, ...], val: float) -> None:
-    samples.setdefault(gauge, {})[labels] = val
+    # float() here, inside the per-device try, so a value that is not a number
+    # skips that device instead of failing publish() for every device.
+    samples.setdefault(gauge, {})[labels] = float(val)
+
+
+# Two devices with the same name in the same room share their series. Their
+# health is then the worse of the two: unreachable, and the older last-seen time.
+_COMBINE = {DEVICE_REACHABLE: min, DEVICE_LAST_SEEN: min}
+
+
+def _merge(samples: Samples, own: Samples) -> None:
+    for gauge, series in own.items():
+        target = samples.setdefault(gauge, {})
+        combine = _COMBINE.get(gauge)
+        for labels, val in series.items():
+            if combine is not None and labels in target:
+                val = combine(target[labels], val)
+            target[labels] = val
 
 
 def _health_samples(device, samples: Samples) -> bool:
@@ -270,23 +294,31 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
     Returns the number of devices scraped on success, or ``None`` on failure.
     Never raises: any error is recorded as ``scrape_success=0`` and logged. After
     a failure, the last values stay up until ``stale_after`` seconds have passed
-    since the last successful poll; then the device series are removed.
+    since the last successful poll; then the device series are removed. The
+    default is 3 times the default poll interval; see ``Config.stale_after``.
     """
     try:
         # One request for all devices. The library's get_environment_sensors()
         # and get_air_purifiers() each fetch /devices and parse the whole list,
         # so one malformed device would fail the poll for every device.
         devices = hub.get("/devices")
+        if not isinstance(devices, list):
+            raise TypeError(f"/devices returned {type(devices).__name__}, not a list")
     except Exception as exc:  # noqa: BLE001 - the exporter must survive any hub error
         SCRAPE_SUCCESS.set(0)
         LOG.error("failed to poll DIRIGERA hub: %s", exc)
-        if time.time() - STATE.last_success > stale_after:
+        if STATE.last_success is None or time.monotonic() - STATE.last_success > stale_after:
             publish({})
         return None
 
     samples: Samples = {}
+    owners: dict[tuple[str, str], str] = {}
     sensors = purifiers = skipped = 0
     for raw in devices:
+        if not isinstance(raw, dict):
+            skipped += 1
+            LOG.warning("skipped a /devices entry that is a %s, not an object", type(raw).__name__)
+            continue
         if raw.get("deviceType") == "environmentSensor":
             kind = "sensor"
         elif raw.get("type") == "airPurifier":
@@ -296,25 +328,35 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
         own: Samples = {}
         try:
             if kind == "sensor":
-                sensor_samples(dict_to_environment_sensor(raw, hub), temp_offset, own)
+                device = dict_to_environment_sensor(raw, hub)
+                sensor_samples(device, temp_offset, own)
             else:
-                purifier_samples(dict_to_air_purifier(raw, hub), own)
+                device = dict_to_air_purifier(raw, hub)
+                purifier_samples(device, own)
         except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
             skipped += 1
             LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
             continue
-        for gauge, series in own.items():
-            samples.setdefault(gauge, {}).update(series)
+        labels = (device_name(device), room_name(device))
+        if labels in owners:
+            LOG.warning(
+                "devices %s and %s are both named %r in room %r, so they share their "
+                "series; give each device a unique name in its room",
+                owners[labels],
+                device.id,
+                *labels,
+            )
+        owners[labels] = device.id
+        _merge(samples, own)
         if kind == "sensor":
             sensors += 1
         else:
             purifiers += 1
 
     publish(samples)
-    now = time.time()
-    STATE.last_success = now
+    STATE.last_success = time.monotonic()
     SCRAPE_SUCCESS.set(1)
-    LAST_SUCCESS.set(now)
+    LAST_SUCCESS.set(time.time())
     LOG.info(
         "polled %d environment sensor(s) and %d air purifier(s)%s",
         sensors,
@@ -326,7 +368,7 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
 
 def run(hub: Hub, config: Config) -> None:  # pragma: no cover - infinite loop
     while True:
-        poll_once(hub, config.temp_offset, stale_after=3 * config.poll_interval)
+        poll_once(hub, config.temp_offset, stale_after=config.stale_after)
         time.sleep(config.poll_interval)
 
 

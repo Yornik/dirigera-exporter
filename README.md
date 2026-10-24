@@ -45,6 +45,9 @@ always current:
   are still published.
 - When the hub stops answering, the last values stay for up to 3 poll intervals,
   so 1 failed poll does not break a graph. Then the device series are removed.
+- Series are labelled by device name and room, so give each device a unique
+  name in its room. Two devices with the same name share their series: the
+  exporter logs a warning, and their health shows the worse of the two.
 
 ## Configuration
 

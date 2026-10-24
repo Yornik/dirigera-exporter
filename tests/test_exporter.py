@@ -219,6 +219,21 @@ def test_dropout_zeros_remove_the_readings_and_good_readings_return():
     assert value("ikea_air_temperature_celsius", **LIVING) == 20.5
 
 
+def test_humidity_zero_drops_every_reading_of_the_sensor():
+    # Only humidity reads 0, the other readings look plausible.
+    hub = FakeHub([make_sensor(temp=23.0, rh=0, co2=650, pm25=5)])
+    ex.poll_once(hub, temp_offset=-2.0)
+
+    for metric in (
+        "ikea_air_temperature_celsius",
+        "ikea_air_humidity_percent",
+        "ikea_air_co2_ppm",
+        "ikea_air_pm25_micrograms_per_cubic_meter",
+    ):
+        assert value(metric, **LIVING) is None, metric
+    assert value("ikea_dirigera_device_reachable", **LIVING) == 1
+
+
 def test_dropout_with_offset_is_not_published_as_the_offset():
     hub = FakeHub([make_sensor(temp=0.0, rh=0, co2=0, pm25=0)])
     ex.poll_once(hub, temp_offset=-2.0)
@@ -298,6 +313,70 @@ def test_bad_device_does_not_stop_the_poll():
     assert value("ikea_air_purifier_motor_speed", **PURIFIER) is None
 
 
+def test_device_that_fails_midway_publishes_nothing(monkeypatch):
+    real = ex.purifier_samples
+
+    def add_samples_then_fail(purifier, samples):
+        real(purifier, samples)
+        raise ValueError("bad value")
+
+    monkeypatch.setattr(ex, "purifier_samples", add_samples_then_fail)
+    hub = FakeHub([make_sensor()], [make_purifier()])
+    count = ex.poll_once(hub, temp_offset=0.0)
+
+    assert count == 1
+    # The samples the purifier added before it failed must not leak out.
+    assert value("ikea_dirigera_device_reachable", **PURIFIER) is None
+    assert value("ikea_air_purifier_motor_speed", **PURIFIER) is None
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+
+
+@pytest.mark.parametrize("payload", [None, {"error": "busy"}, "busy"])
+def test_devices_reply_that_is_not_a_list_is_a_failed_poll(payload):
+    hub = FakeHub([make_sensor()])
+    ex.poll_once(hub, temp_offset=0.0)
+    hub.devices = payload
+    count = ex.poll_once(hub, temp_offset=0.0)
+
+    assert count is None
+    assert value("ikea_dirigera_scrape_success") == 0
+    # Like any failed poll, the last values stay for now.
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+
+
+@pytest.mark.parametrize("entry", ["x", None, 42])
+def test_devices_entry_that_is_not_an_object_is_skipped(entry):
+    hub = FakeHub([make_sensor()], others=[entry])
+    count = ex.poll_once(hub, temp_offset=0.0)
+
+    assert count == 1
+    assert value("ikea_dirigera_scrape_success") == 1
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+
+
+@pytest.mark.parametrize("bad_first", [False, True])
+def test_two_sensors_with_one_name_combine_their_health(caplog, bad_first):
+    good = make_sensor(sensor_id="good")
+    bad = make_sensor(sensor_id="bad", reachable=False, last_seen="2026-10-24T11:00:00.000Z")
+    hub = FakeHub([bad, good] if bad_first else [good, bad])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    # The worse health of the two wins, whichever comes first.
+    assert value("ikea_dirigera_device_reachable", **LIVING) == 0
+    last_seen = value("ikea_dirigera_device_last_seen_timestamp_seconds", **LIVING)
+    assert last_seen == LAST_SEEN_TS - 3600
+    assert "are both named 'ALPSTUGA' in room 'Living room'" in caplog.text
+
+
+def test_sensor_and_purifier_with_one_name_keep_their_readings():
+    hub = FakeHub([make_sensor(name="Air")], [make_purifier(name="Air", reachable=False)])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    air = {"sensor": "Air", "room": "Living room"}
+    assert value("ikea_dirigera_device_reachable", **air) == 0
+    assert value("ikea_air_temperature_celsius", **air) == 21.0
+
+
 def test_other_device_types_are_ignored():
     light = _device("light-1", "light", "light", {"customName": "Lamp"}, "Bedroom", True, LAST_SEEN)
     hub = FakeHub([make_sensor()], others=[light])
@@ -309,7 +388,7 @@ def test_other_device_types_are_ignored():
 
 def test_failure_keeps_values_briefly_then_removes_them(monkeypatch):
     clock = [1000.0]
-    monkeypatch.setattr(ex.time, "time", lambda: clock[0])
+    monkeypatch.setattr(ex.time, "monotonic", lambda: clock[0])
     hub = FakeHub([make_sensor()])
     ex.poll_once(hub, temp_offset=0.0, stale_after=90)
 
@@ -329,6 +408,25 @@ def test_failure_keeps_values_briefly_then_removes_them(monkeypatch):
     hub.error = None
     ex.poll_once(hub, temp_offset=0.0, stale_after=90)
     assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+
+
+def test_wall_clock_step_does_not_remove_values(monkeypatch):
+    monkeypatch.setattr(ex.time, "monotonic", lambda: 1000.0)
+    hub = FakeHub([make_sensor()])
+    ex.poll_once(hub, temp_offset=0.0, stale_after=90)
+
+    # NTP moves the wall clock a day forward, then one poll fails.
+    monkeypatch.setattr(ex.time, "time", lambda: 2e9 + 86400)
+    hub.error = RuntimeError("hub unreachable")
+    ex.poll_once(hub, temp_offset=0.0, stale_after=90)
+
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+
+
+def test_stale_window_is_three_poll_intervals(monkeypatch):
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "10")
+
+    assert ex.Config().stale_after == 30
 
 
 def test_missing_room_defaults_to_unknown():
