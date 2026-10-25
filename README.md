@@ -24,11 +24,30 @@ environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA**) and the state of every
 | `ikea_air_purifier_fan_mode` | `sensor`, `room`, `mode` | `1` for the active fan mode (`off`/`on`/`low`/`medium`/`high`/`auto`), else `0` |
 | `ikea_air_purifier_filter_alarm` | `sensor`, `room` | `1` if the filter needs attention/replacement |
 | `ikea_air_purifier_pm25` | `sensor`, `room` | Air purifier's raw PM2.5 reading — **not** comparable to the µg/m³ metric (the STARKVIND samples only with airflow, so it can be stale/coarse) |
+| `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the sensor or purifier, else `0` |
+| `ikea_dirigera_device_last_seen_timestamp_seconds` | `sensor`, `room` | Unix time the hub last heard from the device |
 | `ikea_dirigera_scrape_success` | — | `1` if the most recent hub poll succeeded, else `0` |
 | `ikea_dirigera_last_success_timestamp_seconds` | — | Unix time of the most recent successful poll |
 
-Only fields a device actually reports are emitted, so a sensor without a CO₂ or
-PM2.5 channel does not publish a misleading `0`.
+Each poll publishes exactly what the hub reported, so a value on `/metrics` is
+always current:
+
+- Only fields a device actually reports are emitted, so a sensor without a CO₂
+  or PM2.5 channel does not publish a misleading `0`.
+- When a sensor drops out, the hub reports `0` for every reading. A humidity of
+  `0` % marks all readings of that sensor as invalid, and a CO₂ of `0` ppm marks
+  only CO₂. Neither is published. A PM2.5 of `0` is clean air and is published.
+- An unreachable device publishes only `ikea_dirigera_device_reachable 0` and its
+  last-seen time, no readings.
+- A reading that stops arriving, and a renamed or removed device, drop out at the
+  next poll instead of keeping their last value.
+- One device the hub describes badly is skipped and logged. The other devices
+  are still published.
+- When the hub stops answering, the last values stay for up to 3 poll intervals,
+  so 1 failed poll does not break a graph. Then the device series are removed.
+- Series are labelled by device name and room, so give each device a unique
+  name in its room. Two devices with the same name share their series: the
+  exporter logs a warning, and their health shows the worse of the two.
 
 ## Configuration
 
