@@ -166,6 +166,20 @@ def room_name(device) -> str:
     return name or "unknown"
 
 
+def borrow_sibling_labels(raw: dict, placed: dict[str, dict]) -> dict:
+    """Give a roomless Matter sub-device the name and room of its sibling.
+
+    The hub splits one Matter device (e.g. TIMMERFLOTTE) into ``<uuid>_1`` and
+    ``<uuid>_2`` with a shared ``relationId``. The app renames and places only
+    one of them; the other keeps the model name and no room.
+    """
+    sibling = placed.get(raw.get("relationId"))
+    if raw.get("room") or sibling is None or sibling is raw:
+        return raw
+    name = sibling["attributes"].get("customName")
+    return {**raw, "room": sibling["room"], "attributes": {**raw["attributes"], "customName": name}}
+
+
 # One poll's readings: gauge -> label values -> value.
 Samples = dict[Gauge, dict[tuple[str, ...], float]]
 
@@ -311,6 +325,11 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             publish({})
         return None
 
+    placed = {
+        raw["relationId"]: raw
+        for raw in devices
+        if isinstance(raw, dict) and raw.get("relationId") and raw.get("room")
+    }
     samples: Samples = {}
     owners: dict[tuple[str, str], str] = {}
     sensors = purifiers = skipped = 0
@@ -327,6 +346,7 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             continue
         own: Samples = {}
         try:
+            raw = borrow_sibling_labels(raw, placed)
             if kind == "sensor":
                 device = dict_to_environment_sensor(raw, hub)
                 sensor_samples(device, temp_offset, own)
@@ -338,7 +358,9 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
             continue
         labels = (device_name(device), room_name(device))
-        if labels in owners:
+        # Siblings of one Matter device share their series on purpose.
+        owner = raw.get("relationId") or device.id
+        if labels in owners and owners[labels] != owner:
             LOG.warning(
                 "devices %s and %s are both named %r in room %r, so they share their "
                 "series; give each device a unique name in its room",
@@ -346,7 +368,7 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
                 device.id,
                 *labels,
             )
-        owners[labels] = device.id
+        owners[labels] = owner
         _merge(samples, own)
         if kind == "sensor":
             sensors += 1
