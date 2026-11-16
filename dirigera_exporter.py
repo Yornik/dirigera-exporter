@@ -166,14 +166,21 @@ def room_name(device) -> str:
     return name or "unknown"
 
 
+def relation_id(raw: dict) -> str | None:
+    """The ``relationId`` that the sub-devices of one device share, if the hub sent one."""
+    relation = raw.get("relationId")
+    return relation if isinstance(relation, str) and relation else None
+
+
 def borrow_sibling_labels(raw: dict, placed: dict[str, dict]) -> dict:
     """Give a roomless Matter sub-device the name and room of its sibling.
 
     The hub splits one Matter device (e.g. TIMMERFLOTTE) into ``<uuid>_1`` and
     ``<uuid>_2`` with a shared ``relationId``. The app renames and places only
-    one of them; the other keeps the model name and no room.
+    one of them; the other keeps the model name and no room. When no sibling is
+    placed in a room, there is nothing to borrow and ``raw`` is returned as is.
     """
-    sibling = placed.get(raw.get("relationId"))
+    sibling = placed.get(relation_id(raw))
     if raw.get("room") or sibling is None or sibling is raw:
         return raw
     name = sibling["attributes"].get("customName")
@@ -325,13 +332,16 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             publish({})
         return None
 
+    # relation_id() takes strings only: any other value from the hub must not
+    # raise here, outside the per-device try.
     placed = {
-        raw["relationId"]: raw
+        relation_id(raw): raw
         for raw in devices
-        if isinstance(raw, dict) and raw.get("relationId") and raw.get("room")
+        if isinstance(raw, dict) and relation_id(raw) and raw.get("room")
     }
     samples: Samples = {}
-    owners: dict[tuple[str, str], str] = {}
+    # Label values -> (what owns the series, id of the last device added to it).
+    owners: dict[tuple[str, str], tuple[str, str]] = {}
     sensors = purifiers = skipped = 0
     for raw in devices:
         if not isinstance(raw, dict):
@@ -359,16 +369,16 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             continue
         labels = (device_name(device), room_name(device))
         # Siblings of one Matter device share their series on purpose.
-        owner = raw.get("relationId") or device.id
-        if labels in owners and owners[labels] != owner:
+        owner = relation_id(raw) or device.id
+        if labels in owners and owners[labels][0] != owner:
             LOG.warning(
                 "devices %s and %s are both named %r in room %r, so they share their "
                 "series; give each device a unique name in its room",
-                owners[labels],
+                owners[labels][1],
                 device.id,
                 *labels,
             )
-        owners[labels] = owner
+        owners[labels] = (owner, device.id)
         _merge(samples, own)
         if kind == "sensor":
             sensors += 1
