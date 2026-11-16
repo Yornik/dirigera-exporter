@@ -2,7 +2,7 @@
 
 A small Prometheus exporter for the **IKEA DIRIGERA** smart-home hub. It polls
 the hub's local HTTPS API on an interval and exposes the readings of every
-environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA**) and the state of every
+environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA** / **TIMMERFLOTTE**) and the state of every
 **STARKVIND** air purifier as Prometheus metrics.
 
 - Pure local polling — no IKEA cloud, no internet round-trip.
@@ -48,6 +48,11 @@ always current:
 - Series are labelled by device name and room, so give each device a unique
   name in its room. Two devices with the same name share their series: the
   exporter logs a warning, and their health shows the worse of the two.
+- The hub lists a Matter sensor such as **TIMMERFLOTTE** as 2 devices, one for
+  temperature and one for humidity. Assign the sensor to a room in the IKEA
+  app: the exporter then publishes both under the name and room you gave it.
+  Without a room, the humidity half keeps the model name, so the humidity of
+  several such sensors lands on 1 series.
 
 ## Configuration
 

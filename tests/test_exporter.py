@@ -538,3 +538,53 @@ def test_several_matter_devices_stay_separate(caplog):
     assert value("ikea_air_humidity_percent", sensor="T Living room", room="Living room") == 60
     assert value("ikea_air_humidity_percent", sensor="T Bedroom", room="Bedroom") == 50
     assert "are both named" not in caplog.text
+
+
+def _matter_pair(relation, room, name="T"):
+    """The 2 halves of a TIMMERFLOTTE: temperature with the name, humidity without."""
+    temp = make_sensor(
+        name=name, room=room, rh=None, co2=None, pm25=None, sensor_id=f"{relation}_1"
+    )
+    hum = make_sensor(
+        name="TIMMERFLOTTE temp/hmd sensor",
+        room=None,
+        temp=None,
+        rh=55,
+        co2=None,
+        pm25=None,
+        sensor_id=f"{relation}_2",
+    )
+    temp["relationId"] = hum["relationId"] = relation
+    return temp, hum
+
+
+@pytest.mark.parametrize("bad", [["a"], {"a": 1}, 7, True])
+def test_relation_id_that_is_not_a_string_does_not_stop_the_poll(caplog, bad):
+    temp, hum = _matter_pair("t", "Bedroom")
+    temp["relationId"] = hum["relationId"] = bad
+
+    # The 2 badly described devices are skipped; the other one is still published.
+    assert ex.poll_once(FakeHub([temp, hum, make_sensor()]), temp_offset=0.0) == 1
+    assert value("ikea_dirigera_scrape_success") == 1
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+    assert "skipped device t_1" in caplog.text
+    assert "skipped device t_2" in caplog.text
+
+
+def test_empty_relation_id_is_no_relation():
+    temp, hum = _matter_pair("t", "Bedroom")
+    temp["relationId"] = hum["relationId"] = ""
+
+    # No sibling is found, so each half keeps its own labels.
+    assert ex.poll_once(FakeHub([temp, hum]), temp_offset=0.0) == 2
+    assert value("ikea_air_temperature_celsius", sensor="T", room="Bedroom") == 21.0
+    unplaced = {"sensor": "TIMMERFLOTTE temp/hmd sensor", "room": "unknown"}
+    assert value("ikea_air_humidity_percent", **unplaced) == 55
+
+
+def test_duplicate_warning_names_device_ids_not_relation_ids(caplog):
+    # 2 unplaced TIMMERFLOTTEs: their humidity halves share one series.
+    devices = [half for relation in ("p", "q") for half in _matter_pair(relation, None)]
+    ex.poll_once(FakeHub(devices), temp_offset=0.0)
+
+    assert "devices p_2 and q_2 are both named 'TIMMERFLOTTE temp/hmd sensor'" in caplog.text
