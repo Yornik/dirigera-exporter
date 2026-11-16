@@ -487,3 +487,54 @@ def test_sensors_and_purifier_counted_together():
 
     assert count == 2
     assert value("ikea_dirigera_scrape_success") == 1
+
+
+def test_matter_siblings_share_name_and_room(caplog):
+    # TIMMERFLOTTE: _1 has temperature, name and room; _2 has humidity only.
+    temp = make_sensor(
+        name="TIMMERFLOTTE Living room", rh=None, co2=None, pm25=None, sensor_id="t_1"
+    )
+    hum = make_sensor(
+        name="TIMMERFLOTTE temp/hmd sensor",
+        room=None,
+        temp=None,
+        rh=63,
+        co2=None,
+        pm25=None,
+        sensor_id="t_2",
+    )
+    temp["relationId"] = hum["relationId"] = "t"
+    ex.poll_once(FakeHub([hum, temp]), temp_offset=0.0)
+
+    labels = {"sensor": "TIMMERFLOTTE Living room", "room": "Living room"}
+    assert value("ikea_air_temperature_celsius", **labels) == 21.0
+    assert value("ikea_air_humidity_percent", **labels) == 63
+    assert (
+        value("ikea_air_humidity_percent", sensor="TIMMERFLOTTE temp/hmd sensor", room="unknown")
+        is None
+    )
+    assert "are both named" not in caplog.text
+
+
+def test_several_matter_devices_stay_separate(caplog):
+    devices = []
+    for rid, room, rh in (("a", "Living room", 60), ("b", "Bedroom", 50)):
+        temp = make_sensor(
+            name=f"T {room}", room=room, rh=None, co2=None, pm25=None, sensor_id=f"{rid}_1"
+        )
+        hum = make_sensor(
+            name="TIMMERFLOTTE temp/hmd sensor",
+            room=None,
+            temp=None,
+            rh=rh,
+            co2=None,
+            pm25=None,
+            sensor_id=f"{rid}_2",
+        )
+        temp["relationId"] = hum["relationId"] = rid
+        devices += [temp, hum]
+    ex.poll_once(FakeHub(devices), temp_offset=0.0)
+
+    assert value("ikea_air_humidity_percent", sensor="T Living room", room="Living room") == 60
+    assert value("ikea_air_humidity_percent", sensor="T Bedroom", room="Bedroom") == 50
+    assert "are both named" not in caplog.text
