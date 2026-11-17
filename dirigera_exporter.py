@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Prometheus exporter for IKEA DIRIGERA air-quality devices.
+"""Prometheus exporter for IKEA DIRIGERA devices.
 
 Polls a DIRIGERA hub's local HTTPS API on a fixed interval and exposes:
 
 * every environment sensor (e.g. ALPSTUGA / VINDSTYRKA): temperature, humidity,
   CO2 and PM2.5;
 * every STARKVIND air purifier: on/off state, fan mode, motor speed, filter
-  alarm and its built-in PM2.5 reading.
+  alarm and its built-in PM2.5 reading;
+* every light: on/off state, brightness and colour temperature;
+* every motion sensor and light sensor: motion and illuminance;
+* every remote control and motion sensor: battery level.
+
+The exporter only reads. It never switches a device.
 
 Configuration is via environment variables only; no secrets are baked into the
 image. The exporter is designed to never crash on hub/network errors: a failed
@@ -21,6 +26,7 @@ instead of keeping their last value.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import sys
@@ -90,7 +96,39 @@ PURIFIER_PM25 = Gauge(
     _LABELS,
 )
 
-# --- per-device health, for environment sensors and air purifiers ---
+# --- lights, motion sensors and light sensors ---
+LIGHT_ON = Gauge(
+    "ikea_light_on",
+    "1 if the light is switched on, 0 if it is off.",
+    _LABELS,
+)
+LIGHT_LEVEL = Gauge(
+    "ikea_light_level_percent",
+    "Brightness the light is set to, 1-100. A light that is off keeps its last level.",
+    _LABELS,
+)
+LIGHT_COLOR_TEMPERATURE = Gauge(
+    "ikea_light_color_temperature_kelvin",
+    "Colour temperature the light is set to, in kelvin.",
+    _LABELS,
+)
+MOTION_DETECTED = Gauge(
+    "ikea_motion_detected",
+    "1 if the motion sensor reports motion at the time of the poll, else 0.",
+    _LABELS,
+)
+ILLUMINANCE = Gauge(
+    "ikea_illuminance_lux",
+    "Illuminance at the light sensor, as the hub reports it.",
+    _LABELS,
+)
+
+# --- per-device health, for every device the exporter reads ---
+DEVICE_BATTERY = Gauge(
+    "ikea_dirigera_device_battery_percent",
+    "Battery level of a battery-powered device, 0-100.",
+    _LABELS,
+)
 DEVICE_REACHABLE = Gauge(
     "ikea_dirigera_device_reachable",
     "1 if the hub can reach the device, 0 if not. An unreachable device publishes no readings.",
@@ -114,6 +152,12 @@ DEVICE_GAUGES = (
     PURIFIER_FAN_MODE,
     PURIFIER_FILTER_ALARM,
     PURIFIER_PM25,
+    LIGHT_ON,
+    LIGHT_LEVEL,
+    LIGHT_COLOR_TEMPERATURE,
+    MOTION_DETECTED,
+    ILLUMINANCE,
+    DEVICE_BATTERY,
     DEVICE_REACHABLE,
     DEVICE_LAST_SEEN,
 )
@@ -199,6 +243,9 @@ class _State:
         # time.monotonic() of the last successful poll, so a wall-clock step
         # (NTP, a VM resume) cannot make the values look fresh or stale.
         self.last_success: float | None = None
+        # The duplicate names of the last poll, so each one is logged when it
+        # appears and not again at every poll.
+        self.duplicates: set[tuple] = set()
 
 
 STATE = _State()
@@ -227,8 +274,16 @@ def _add(samples: Samples, gauge: Gauge, labels: tuple[str, ...], val: float) ->
 
 
 # Two devices with the same name in the same room share their series. Their
-# health is then the worse of the two: unreachable, and the older last-seen time.
-_COMBINE = {DEVICE_REACHABLE: min, DEVICE_LAST_SEEN: min}
+# health is then the worse of the two: unreachable, the older last-seen time and
+# the emptier battery. A shared light is on, and a shared motion sensor sees
+# motion, if either device does.
+_COMBINE = {
+    DEVICE_REACHABLE: min,
+    DEVICE_LAST_SEEN: min,
+    DEVICE_BATTERY: min,
+    LIGHT_ON: max,
+    MOTION_DETECTED: max,
+}
 
 
 def _merge(samples: Samples, own: Samples) -> None:
@@ -309,6 +364,72 @@ def purifier_samples(purifier: AirPurifier, samples: Samples) -> None:
         _add(samples, PURIFIER_PM25, labels, attrs.current_p_m25)
 
 
+def raw_labels(raw: dict) -> tuple[str, str]:
+    """Name and room of a device that is read from the raw hub entry."""
+    name = raw["attributes"].get("customName") or raw["id"]
+    room = raw.get("room")
+    return (name, (room.get("name") if isinstance(room, dict) else None) or "unknown")
+
+
+def _raw_health_samples(raw: dict, samples: Samples) -> bool:
+    """Like ``_health_samples``, for a device that is read from the raw hub entry."""
+    labels = raw_labels(raw)
+    reachable = bool(raw.get("isReachable", True))
+    _add(samples, DEVICE_REACHABLE, labels, 1 if reachable else 0)
+    last_seen = raw.get("lastSeen")
+    if last_seen is not None:
+        # fromisoformat() reads the hub's trailing "Z" from Python 3.11 on.
+        seen = datetime.datetime.fromisoformat(last_seen)
+        _add(samples, DEVICE_LAST_SEEN, labels, seen.timestamp())
+    return reachable
+
+
+# What each kind of device publishes: attribute of the hub entry -> gauge. The
+# dirigera library has no model for a Matter remote ("genericSwitch") and marks
+# the light sensor of a motion sensor as type "unknown", so these kinds are read
+# from the raw entry. A missing attribute publishes nothing.
+_RAW_ATTRIBUTES: dict[str, dict[str, Gauge]] = {
+    "light": {
+        "isOn": LIGHT_ON,
+        "lightLevel": LIGHT_LEVEL,
+        "colorTemperature": LIGHT_COLOR_TEMPERATURE,
+    },
+    "motion sensor": {"isDetected": MOTION_DETECTED, "batteryPercentage": DEVICE_BATTERY},
+    "light sensor": {"illuminance": ILLUMINANCE},
+    "remote": {"batteryPercentage": DEVICE_BATTERY},
+}
+
+
+def raw_samples(raw: dict, kind: str, samples: Samples) -> None:
+    """Add the state of one light, motion sensor, light sensor or remote."""
+    if not _raw_health_samples(raw, samples):
+        return
+    labels = raw_labels(raw)
+    attrs = raw["attributes"]
+    for attribute, gauge in _RAW_ATTRIBUTES[kind].items():
+        val = attrs.get(attribute)
+        if val is not None:
+            _add(samples, gauge, labels, val)
+
+
+def device_kind(raw: dict) -> str | None:
+    """The kind of device the exporter reads ``raw`` as, or ``None`` to ignore it."""
+    device_type = raw.get("deviceType")
+    if device_type == "environmentSensor":
+        return "environment sensor"
+    if raw.get("type") == "airPurifier":
+        return "air purifier"
+    if device_type == "light":
+        return "light"
+    if device_type == "motionSensor":
+        return "motion sensor"
+    if device_type == "lightSensor":
+        return "light sensor"
+    if raw.get("type") == "controller":
+        return "remote"
+    return None
+
+
 def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | None:
     """Poll the hub once.
 
@@ -342,60 +463,63 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
     samples: Samples = {}
     # Label values -> (what owns the series, id of the last device added to it).
     owners: dict[tuple[str, str], tuple[str, str]] = {}
-    sensors = purifiers = skipped = 0
+    duplicates: set[tuple] = set()
+    counts: dict[str, int] = {"environment sensor": 0, "air purifier": 0}
+    skipped = 0
     for raw in devices:
         if not isinstance(raw, dict):
             skipped += 1
             LOG.warning("skipped a /devices entry that is a %s, not an object", type(raw).__name__)
             continue
-        if raw.get("deviceType") == "environmentSensor":
-            kind = "sensor"
-        elif raw.get("type") == "airPurifier":
-            kind = "purifier"
-        else:
+        kind = device_kind(raw)
+        if kind is None:
             continue
         own: Samples = {}
         try:
             raw = borrow_sibling_labels(raw, placed)
-            if kind == "sensor":
+            if kind == "environment sensor":
                 device = dict_to_environment_sensor(raw, hub)
                 sensor_samples(device, temp_offset, own)
-            else:
+                labels, device_id = (device_name(device), room_name(device)), device.id
+            elif kind == "air purifier":
                 device = dict_to_air_purifier(raw, hub)
                 purifier_samples(device, own)
+                labels, device_id = (device_name(device), room_name(device)), device.id
+            else:
+                raw_samples(raw, kind, own)
+                labels, device_id = raw_labels(raw), str(raw["id"])
         except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
             skipped += 1
             LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
             continue
-        labels = (device_name(device), room_name(device))
         # Siblings of one Matter device share their series on purpose.
-        owner = relation_id(raw) or device.id
+        owner = relation_id(raw) or device_id
         if labels in owners and owners[labels][0] != owner:
-            LOG.warning(
-                "devices %s and %s are both named %r in room %r, so they share their "
-                "series; give each device a unique name in its room",
-                owners[labels][1],
-                device.id,
-                *labels,
-            )
-        owners[labels] = (owner, device.id)
+            duplicate = (frozenset((owners[labels][1], device_id)), labels)
+            duplicates.add(duplicate)
+            if duplicate not in STATE.duplicates:
+                LOG.warning(
+                    "devices %s and %s are both named %r in room %r, so they share their "
+                    "series; give each device a unique name in its room",
+                    owners[labels][1],
+                    device_id,
+                    *labels,
+                )
+        owners[labels] = (owner, device_id)
         _merge(samples, own)
-        if kind == "sensor":
-            sensors += 1
-        else:
-            purifiers += 1
+        counts[kind] = counts.get(kind, 0) + 1
 
     publish(samples)
+    STATE.duplicates = duplicates
     STATE.last_success = time.monotonic()
     SCRAPE_SUCCESS.set(1)
     LAST_SUCCESS.set(time.time())
     LOG.info(
-        "polled %d environment sensor(s) and %d air purifier(s)%s",
-        sensors,
-        purifiers,
+        "polled %s%s",
+        ", ".join(f"{count} {kind}(s)" for kind, count in counts.items()),
         f", skipped {skipped}" if skipped else "",
     )
-    return sensors + purifiers
+    return sum(counts.values())
 
 
 def run(hub: Hub, config: Config) -> None:  # pragma: no cover - infinite loop

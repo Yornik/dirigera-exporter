@@ -378,12 +378,14 @@ def test_sensor_and_purifier_with_one_name_keep_their_readings():
 
 
 def test_other_device_types_are_ignored():
-    light = _device("light-1", "light", "light", {"customName": "Lamp"}, "Bedroom", True, LAST_SEEN)
-    hub = FakeHub([make_sensor()], others=[light])
+    blind = _device(
+        "blind-1", "blinds", "blinds", {"customName": "Blind"}, "Bedroom", True, LAST_SEEN
+    )
+    hub = FakeHub([make_sensor()], others=[blind])
     count = ex.poll_once(hub, temp_offset=0.0)
 
     assert count == 1
-    assert value("ikea_dirigera_device_reachable", sensor="Lamp", room="Bedroom") is None
+    assert value("ikea_dirigera_device_reachable", sensor="Blind", room="Bedroom") is None
 
 
 def test_failure_keeps_values_briefly_then_removes_them(monkeypatch):
@@ -588,3 +590,199 @@ def test_duplicate_warning_names_device_ids_not_relation_ids(caplog):
     ex.poll_once(FakeHub(devices), temp_offset=0.0)
 
     assert "devices p_2 and q_2 are both named 'TIMMERFLOTTE temp/hmd sensor'" in caplog.text
+
+
+# --- lights, motion sensors, light sensors and remotes ---
+# The attribute sets below are those of a live hub, without the fields the
+# exporter does not read.
+
+
+def make_light(
+    name="Lamp",
+    room="Bedroom",
+    on=True,
+    level=40,
+    kelvin=2702,
+    light_id="light-1",
+    reachable=True,
+    last_seen=LAST_SEEN,
+):
+    attrs = {
+        "customName": name,
+        "isOn": on,
+        "lightLevel": level,
+        "colorTemperature": kelvin,
+        "colorMode": "temperature",
+        "deviceOnBehavior": {"behavior": "lastValue", "profileId": ""},
+    }
+    return _device(light_id, "light", "light", attrs, room, reachable, last_seen)
+
+
+def make_remote(relation="wheel", name="Wheel", room="Bedroom", battery=86, reachable=True):
+    """The 3 entries of 1 BILRESA scroll wheel: only the first has the name and the room."""
+    entries = []
+    for suffix, group in (("3", 1), ("6", 2), ("9", 3)):
+        named = group == 1
+        attrs = {
+            "customName": name if named else "BILRESA scroll wheel",
+            "batteryPercentage": battery,
+            "switchGroup": group,
+            "switchLabel": "button",
+            "controlMode": "light",
+        }
+        entry = _device(
+            f"{relation}_{suffix}",
+            "controller",
+            "genericSwitch",
+            attrs,
+            room if named else None,
+            reachable,
+            LAST_SEEN,
+        )
+        entry["relationId"] = relation
+        entries.append(entry)
+    return entries
+
+
+def make_motion_sensor(relation="motion", name="Hall sensor", room="Entrance", detected=False):
+    """The 2 entries of 1 VALLHORN: the motion sensor, and a light sensor with no name."""
+    motion_attrs = {
+        "customName": name,
+        "batteryPercentage": 97,
+        "isOn": False,
+        "isDetected": detected,
+        "motionDetectedDelay": 20,
+        "sensorConfig": {"onDuration": 180, "scheduleOn": False},
+    }
+    motion = _device(f"{relation}_1", "sensor", "motionSensor", motion_attrs, room, True, LAST_SEEN)
+    light_attrs = {"customName": "", "illuminance": 12}
+    light = _device(f"{relation}_3", "unknown", "lightSensor", light_attrs, None, True, LAST_SEEN)
+    motion["relationId"] = light["relationId"] = relation
+    return [motion, light]
+
+
+def test_light_state_is_exported():
+    count = ex.poll_once(FakeHub(others=[make_light()]), temp_offset=0.0)
+
+    lamp = {"sensor": "Lamp", "room": "Bedroom"}
+    assert count == 1
+    assert value("ikea_light_on", **lamp) == 1
+    assert value("ikea_light_level_percent", **lamp) == 40
+    assert value("ikea_light_color_temperature_kelvin", **lamp) == 2702
+    assert value("ikea_dirigera_device_reachable", **lamp) == 1
+    assert value("ikea_dirigera_device_last_seen_timestamp_seconds", **lamp) == LAST_SEEN_TS
+
+
+def test_light_that_is_off_keeps_its_level():
+    ex.poll_once(FakeHub(others=[make_light(on=False, level=14)]), temp_offset=0.0)
+
+    lamp = {"sensor": "Lamp", "room": "Bedroom"}
+    assert value("ikea_light_on", **lamp) == 0
+    assert value("ikea_light_level_percent", **lamp) == 14
+
+
+def test_light_without_colour_temperature_publishes_none():
+    light = make_light(kelvin=None)
+    ex.poll_once(FakeHub(others=[light]), temp_offset=0.0)
+
+    lamp = {"sensor": "Lamp", "room": "Bedroom"}
+    assert value("ikea_light_on", **lamp) == 1
+    assert value("ikea_light_color_temperature_kelvin", **lamp) is None
+
+
+def test_unreachable_light_publishes_only_its_health():
+    ex.poll_once(FakeHub(others=[make_light(reachable=False)]), temp_offset=0.0)
+
+    lamp = {"sensor": "Lamp", "room": "Bedroom"}
+    assert value("ikea_dirigera_device_reachable", **lamp) == 0
+    assert value("ikea_light_on", **lamp) is None
+    assert value("ikea_light_level_percent", **lamp) is None
+
+
+def test_two_lights_with_one_name_are_on_if_either_is(caplog):
+    lights = [make_light(light_id="a", on=False), make_light(light_id="b", on=True)]
+    for order in (lights, lights[::-1]):
+        ex.poll_once(FakeHub(others=order), temp_offset=0.0)
+        assert value("ikea_light_on", sensor="Lamp", room="Bedroom") == 1
+    assert "are both named 'Lamp' in room 'Bedroom'" in caplog.text
+
+
+def test_remote_entries_share_one_battery_series(caplog):
+    count = ex.poll_once(FakeHub(others=make_remote()), temp_offset=0.0)
+
+    wheel = {"sensor": "Wheel", "room": "Bedroom"}
+    assert count == 3
+    assert value("ikea_dirigera_device_battery_percent", **wheel) == 86
+    assert value("ikea_dirigera_device_reachable", **wheel) == 1
+    # The entries without a name of their own do not get a series.
+    unnamed = {"sensor": "BILRESA scroll wheel", "room": "unknown"}
+    assert value("ikea_dirigera_device_battery_percent", **unnamed) is None
+    assert "are both named" not in caplog.text
+
+
+def test_unreachable_remote_publishes_no_battery():
+    ex.poll_once(FakeHub(others=make_remote(reachable=False)), temp_offset=0.0)
+
+    wheel = {"sensor": "Wheel", "room": "Bedroom"}
+    assert value("ikea_dirigera_device_reachable", **wheel) == 0
+    assert value("ikea_dirigera_device_battery_percent", **wheel) is None
+
+
+def test_motion_sensor_and_its_light_sensor_share_name_and_room(caplog):
+    count = ex.poll_once(FakeHub(others=make_motion_sensor(detected=True)), temp_offset=0.0)
+
+    hall = {"sensor": "Hall sensor", "room": "Entrance"}
+    assert count == 2
+    assert value("ikea_motion_detected", **hall) == 1
+    assert value("ikea_illuminance_lux", **hall) == 12
+    assert value("ikea_dirigera_device_battery_percent", **hall) == 97
+    # The motion sensor has an "isOn" of its own. It is not a light.
+    assert value("ikea_light_on", **hall) is None
+    assert "are both named" not in caplog.text
+
+
+def test_no_motion_is_published_as_zero():
+    ex.poll_once(FakeHub(others=make_motion_sensor(detected=False)), temp_offset=0.0)
+
+    assert value("ikea_motion_detected", sensor="Hall sensor", room="Entrance") == 0
+
+
+def test_light_with_a_bad_value_is_skipped_and_the_rest_published(caplog):
+    bad = make_light(name="Bad", level="bright")
+    count = ex.poll_once(FakeHub([make_sensor()], others=[bad, make_light()]), temp_offset=0.0)
+
+    assert count == 2
+    assert value("ikea_light_on", sensor="Bad", room="Bedroom") is None
+    assert value("ikea_dirigera_device_reachable", sensor="Bad", room="Bedroom") is None
+    assert value("ikea_light_on", sensor="Lamp", room="Bedroom") == 1
+    assert "skipped device light-1" in caplog.text
+
+
+def test_light_that_goes_away_is_removed():
+    ex.poll_once(FakeHub(others=[make_light()]), temp_offset=0.0)
+    ex.poll_once(FakeHub(others=[]), temp_offset=0.0)
+
+    assert value("ikea_light_on", sensor="Lamp", room="Bedroom") is None
+
+
+def test_poll_log_counts_each_kind(caplog):
+    caplog.set_level("INFO")
+    others = [make_light(), *make_remote(), *make_motion_sensor()]
+    ex.poll_once(FakeHub([make_sensor()], [make_purifier()], others=others), temp_offset=0.0)
+
+    assert (
+        "polled 1 environment sensor(s), 1 air purifier(s), 1 light(s), 3 remote(s), "
+        "1 motion sensor(s), 1 light sensor(s)" in caplog.text
+    )
+
+
+def test_duplicate_name_is_logged_once_until_it_changes(caplog):
+    lights = [make_light(light_id="a"), make_light(light_id="b")]
+    for _ in range(3):
+        ex.poll_once(FakeHub(others=lights), temp_offset=0.0)
+    assert caplog.text.count("are both named 'Lamp'") == 1
+
+    # The duplicate goes away and comes back: that is news again.
+    ex.poll_once(FakeHub(others=lights[:1]), temp_offset=0.0)
+    ex.poll_once(FakeHub(others=lights), temp_offset=0.0)
+    assert caplog.text.count("are both named 'Lamp'") == 2
