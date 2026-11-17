@@ -32,6 +32,17 @@
         "patch"
       ],
       "automerge": true
+    },
+    {
+      "description": "Python packages: dirigera, prometheus-client, pytest and ruff. The tests run every device kind through the real parsers of dirigera, and CI runs ruff, so a green CI is the check.",
+      "matchDatasources": [
+        "pypi"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
     }
   ],
   "semanticCommits": "enabled",

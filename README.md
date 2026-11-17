@@ -3,7 +3,9 @@
 A small Prometheus exporter for the **IKEA DIRIGERA** smart-home hub. It polls
 the hub's local HTTPS API on an interval and exposes the readings of every
 environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA** / **TIMMERFLOTTE**) and the state of every
-**STARKVIND** air purifier as Prometheus metrics.
+**STARKVIND** air purifier as Prometheus metrics. It also exposes the state of
+every light, motion sensor and light sensor, and the battery level of every
+remote control and motion sensor. It only reads: it never switches a device.
 
 - Pure local polling — no IKEA cloud, no internet round-trip.
 - Configuration via environment variables only; the API token is never baked
@@ -24,7 +26,13 @@ environment sensor (e.g. **VINDSTYRKA** / **ALPSTUGA** / **TIMMERFLOTTE**) and t
 | `ikea_air_purifier_fan_mode` | `sensor`, `room`, `mode` | `1` for the active fan mode (`off`/`on`/`low`/`medium`/`high`/`auto`), else `0` |
 | `ikea_air_purifier_filter_alarm` | `sensor`, `room` | `1` if the filter needs attention/replacement |
 | `ikea_air_purifier_pm25` | `sensor`, `room` | Air purifier's raw PM2.5 reading — **not** comparable to the µg/m³ metric (the STARKVIND samples only with airflow, so it can be stale/coarse) |
-| `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the sensor or purifier, else `0` |
+| `ikea_light_on` | `sensor`, `room` | `1` if the light is switched on, else `0` |
+| `ikea_light_level_percent` | `sensor`, `room` | Brightness the light is set to (1–100). A light that is off keeps its last level |
+| `ikea_light_color_temperature_kelvin` | `sensor`, `room` | Colour temperature the light is set to, in kelvin |
+| `ikea_motion_detected` | `sensor`, `room` | `1` if the motion sensor reports motion at the time of the poll, else `0` |
+| `ikea_illuminance_lux` | `sensor`, `room` | Illuminance at the light sensor of a motion sensor, in lux. The hub sends the Zigbee value `10000 × log10(lux) + 1`; the exporter converts it. `0` is too dark to measure |
+| `ikea_dirigera_device_battery_percent` | `sensor`, `room` | Battery level of a remote control or motion sensor (0–100) |
+| `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the device, else `0` |
 | `ikea_dirigera_device_last_seen_timestamp_seconds` | `sensor`, `room` | Unix time the hub last heard from the device |
 | `ikea_dirigera_scrape_success` | — | `1` if the most recent hub poll succeeded, else `0` |
 | `ikea_dirigera_last_success_timestamp_seconds` | — | Unix time of the most recent successful poll |
@@ -47,7 +55,17 @@ always current:
   so 1 failed poll does not break a graph. Then the device series are removed.
 - Series are labelled by device name and room, so give each device a unique
   name in its room. Two devices with the same name share their series: the
-  exporter logs a warning, and their health shows the worse of the two.
+  exporter logs a warning once, and their health shows the worse of the two.
+  Two lights with the same name show as on when either is on.
+- The hub is polled, so a motion that starts and ends between 2 polls is not
+  seen. With the default `POLL_INTERVAL_SECONDS` of 30, read
+  `ikea_motion_detected` as "motion at the time of the poll".
+- A remote control has no position or level of its own. The hub reports only
+  its battery and when it was last heard from. The brightness it sets shows on
+  the lights.
+- The hub lists a Matter remote such as the **BILRESA** scroll wheel as 3
+  devices, and a **VALLHORN** motion sensor as a motion sensor and a light
+  sensor. They are published as 1 device under the name and room you gave it.
 - The hub lists a Matter sensor such as **TIMMERFLOTTE** as 2 devices, one for
   temperature and one for humidity. Assign the sensor to a room in the IKEA
   app: the exporter then publishes both under the name and room you gave it.
