@@ -11,6 +11,11 @@ Polls a DIRIGERA hub's local HTTPS API on a fixed interval and exposes:
 * every motion sensor and light sensor: motion and illuminance;
 * every remote control and motion sensor: battery level.
 
+The exporter also listens to the hub's event stream. An event updates the
+values at once, between 2 polls, and lets the exporter count every motion and
+every press of a remote control. The poll stays the source of truth: it
+corrects whatever the event stream missed.
+
 The exporter only reads. It never switches a device.
 
 Configuration is via environment variables only; no secrets are baked into the
@@ -26,9 +31,11 @@ instead of keeping their last value.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import threading
 import time
 import warnings
 
@@ -40,7 +47,7 @@ from dirigera.devices.environment_sensor import EnvironmentSensor, dict_to_envir
 from dirigera.devices.light import dict_to_light
 from dirigera.devices.light_sensor import dict_to_light_sensor
 from dirigera.devices.motion_sensor import dict_to_motion_sensor
-from prometheus_client import Gauge, start_http_server
+from prometheus_client import Counter, Gauge, start_http_server
 
 LOG = logging.getLogger("dirigera-exporter")
 
@@ -126,6 +133,26 @@ ILLUMINANCE = Gauge(
     _LABELS,
 )
 
+MOTION_LAST = Gauge(
+    "ikea_motion_last_detected_timestamp_seconds",
+    "Unix time the motion sensor last started to report motion, since the exporter started.",
+    _LABELS,
+)
+
+# --- counted from the event stream, and from a change between 2 polls ---
+# A counter keeps its series when a device is renamed or removed: rate() and
+# increase() need the history, and a stale counter does not look like a reading.
+MOTION_DETECTIONS = Counter(
+    "ikea_motion_detections",
+    "Times the motion sensor started to report motion.",
+    _LABELS,
+)
+REMOTE_PRESSES = Counter(
+    "ikea_remote_presses",
+    "Presses of a remote control, by click pattern (for example singlePress).",
+    (*_LABELS, "pattern"),
+)
+
 # --- per-device health, for every device the exporter reads ---
 DEVICE_BATTERY = Gauge(
     "ikea_dirigera_device_battery_percent",
@@ -159,6 +186,7 @@ DEVICE_GAUGES = (
     LIGHT_LEVEL,
     LIGHT_COLOR_TEMPERATURE,
     MOTION_DETECTED,
+    MOTION_LAST,
     ILLUMINANCE,
     DEVICE_BATTERY,
     DEVICE_REACHABLE,
@@ -176,6 +204,17 @@ LAST_SUCCESS = Gauge(
 )
 
 
+EVENTS = Counter(
+    "ikea_dirigera_events",
+    "Events received from the hub's event stream, by event type.",
+    ("type",),
+)
+EVENT_STREAM_CONNECTED = Gauge(
+    "ikea_dirigera_event_stream_connected",
+    "1 if the exporter is connected to the hub's event stream, 0 otherwise.",
+)
+
+
 class Config:
     """Runtime configuration, sourced entirely from environment variables."""
 
@@ -185,6 +224,8 @@ class Config:
         self.poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
         self.temp_offset = float(os.environ.get("TEMP_OFFSET_CELSIUS", "0.0"))
         self.listen_port = int(os.environ.get("LISTEN_PORT", "9119"))
+        event_stream = os.environ.get("EVENT_STREAM", "true").strip().lower()
+        self.event_stream = event_stream not in ("0", "false", "no", "off")
 
     @property
     def stale_after(self) -> float:
@@ -249,9 +290,18 @@ class _State:
         # The duplicate names of the last poll, so each one is logged when it
         # appears and not again at every poll.
         self.duplicates: set[tuple] = set()
+        # The /devices list of the last poll, with the events since then merged
+        # in. The published values are always built from this list.
+        self.devices: list = []
+        # Device id -> Unix time its motion sensor last started to report motion.
+        self.last_motion: dict[str, float] = {}
 
 
 STATE = _State()
+
+# The poll loop and the event listener run in 2 threads. Both change STATE and
+# publish, so each does it under this lock.
+_LOCK = threading.RLock()
 
 
 def publish(samples: Samples) -> None:
@@ -431,6 +481,125 @@ def device_kind(raw: dict) -> str | None:
     return None
 
 
+def raw_labels(raw: dict, placed: dict[str, dict]) -> tuple[str, str]:
+    """The series labels of a raw hub entry: the same as ``device_name`` and ``room_name``."""
+    raw = borrow_sibling_labels(raw, placed)
+    room = raw.get("room")
+    room_label = (room.get("name") if isinstance(room, dict) else None) or "unknown"
+    return (raw["attributes"].get("customName") or str(raw["id"]), room_label)
+
+
+def _placed(devices: list) -> dict[str, dict]:
+    # relation_id() takes strings only: any other value from the hub must not
+    # raise here, outside the per-device try.
+    return {
+        relation_id(raw): raw
+        for raw in devices
+        if isinstance(raw, dict) and relation_id(raw) and raw.get("room")
+    }
+
+
+def _detects_motion(raw: dict | None) -> bool:
+    if not isinstance(raw, dict) or raw.get("deviceType") != "motionSensor":
+        return False
+    attrs = raw.get("attributes")
+    return (
+        isinstance(attrs, dict)
+        and attrs.get("isDetected") is True
+        and raw.get("isReachable", True) is not False
+    )
+
+
+def _track_motion(old: dict | None, new: dict, placed: dict[str, dict]) -> None:
+    """Count a motion sensor that starts to report motion.
+
+    ``old`` is the entry before the change, or ``None`` for a device seen for
+    the first time. A sensor that already reports motion at the first poll is
+    not counted: the exporter cannot know when that motion started.
+    """
+    if not _detects_motion(new) or _detects_motion(old):
+        return
+    STATE.last_motion[str(new["id"])] = time.time()
+    if old is not None:
+        MOTION_DETECTIONS.labels(*raw_labels(new, placed)).inc()
+
+
+def _publish_devices(hub: Hub, temp_offset: float, log: bool = True) -> tuple[dict[str, int], int]:
+    """Publish the values of ``STATE.devices``.
+
+    Returns the number of devices of each kind, and the number skipped. With
+    ``log=False`` it does not log a skipped device or a duplicate name: the
+    rebuild after an event would repeat the warnings of the last poll.
+    """
+    devices = STATE.devices
+    placed = _placed(devices)
+    samples: Samples = {}
+    # Label values -> (what owns the series, id of the last device added to it).
+    owners: dict[tuple[str, str], tuple[str, str]] = {}
+    duplicates: set[tuple] = set()
+    counts: dict[str, int] = {"environment sensor": 0, "air purifier": 0}
+    skipped = 0
+    for raw in devices:
+        if not isinstance(raw, dict):
+            skipped += 1
+            if log:
+                LOG.warning(
+                    "skipped a /devices entry that is a %s, not an object", type(raw).__name__
+                )
+            continue
+        kind = device_kind(raw)
+        if kind is None:
+            continue
+        own: Samples = {}
+        try:
+            raw = borrow_sibling_labels(raw, placed)
+            if kind == "environment sensor":
+                device = dict_to_environment_sensor(raw, hub)
+                sensor_samples(device, temp_offset, own)
+            elif kind == "air purifier":
+                device = dict_to_air_purifier(raw, hub)
+                purifier_samples(device, own)
+            else:
+                device = _SIMPLE_KINDS[kind][0](raw, hub)
+                simple_samples(device, kind, own)
+            labels = (device_name(device), room_name(device))
+            # A counter that first appears at 1 loses that step in increase().
+            # So each counter starts at 0 as soon as the device is known.
+            if kind == "motion sensor":
+                MOTION_DETECTIONS.labels(*labels)
+                last_motion = STATE.last_motion.get(device.id)
+                if last_motion is not None:
+                    _add(own, MOTION_LAST, labels, last_motion)
+            elif kind == "remote":
+                REMOTE_PRESSES.labels(*labels, "singlePress")
+        except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
+            skipped += 1
+            if log:
+                LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
+            continue
+        # Siblings of one Matter device share their series on purpose.
+        owner = relation_id(raw) or device.id
+        if labels in owners and owners[labels][0] != owner:
+            duplicate = (frozenset((owners[labels][1], device.id)), labels)
+            duplicates.add(duplicate)
+            if log and duplicate not in STATE.duplicates:
+                LOG.warning(
+                    "devices %s and %s are both named %r in room %r, so they share their "
+                    "series; give each device a unique name in its room",
+                    owners[labels][1],
+                    device.id,
+                    *labels,
+                )
+        owners[labels] = (owner, device.id)
+        _merge(samples, own)
+        counts[kind] = counts.get(kind, 0) + 1
+
+    publish(samples)
+    if log:
+        STATE.duplicates = duplicates
+    return counts, skipped
+
+
 def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | None:
     """Poll the hub once.
 
@@ -450,76 +619,118 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
     except Exception as exc:  # noqa: BLE001 - the exporter must survive any hub error
         SCRAPE_SUCCESS.set(0)
         LOG.error("failed to poll DIRIGERA hub: %s", exc)
-        if STATE.last_success is None or time.monotonic() - STATE.last_success > stale_after:
-            publish({})
+        with _LOCK:
+            if STATE.last_success is None or time.monotonic() - STATE.last_success > stale_after:
+                # An event must not publish the old list again.
+                STATE.devices = []
+                publish({})
         return None
 
-    # relation_id() takes strings only: any other value from the hub must not
-    # raise here, outside the per-device try.
-    placed = {
-        relation_id(raw): raw
-        for raw in devices
-        if isinstance(raw, dict) and relation_id(raw) and raw.get("room")
-    }
-    samples: Samples = {}
-    # Label values -> (what owns the series, id of the last device added to it).
-    owners: dict[tuple[str, str], tuple[str, str]] = {}
-    duplicates: set[tuple] = set()
-    counts: dict[str, int] = {"environment sensor": 0, "air purifier": 0}
-    skipped = 0
-    for raw in devices:
-        if not isinstance(raw, dict):
-            skipped += 1
-            LOG.warning("skipped a /devices entry that is a %s, not an object", type(raw).__name__)
-            continue
-        kind = device_kind(raw)
-        if kind is None:
-            continue
-        own: Samples = {}
+    with _LOCK:
         try:
-            raw = borrow_sibling_labels(raw, placed)
-            if kind == "environment sensor":
-                device = dict_to_environment_sensor(raw, hub)
-                sensor_samples(device, temp_offset, own)
-            elif kind == "air purifier":
-                device = dict_to_air_purifier(raw, hub)
-                purifier_samples(device, own)
-            else:
-                device = _SIMPLE_KINDS[kind][0](raw, hub)
-                simple_samples(device, kind, own)
-        except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
-            skipped += 1
-            LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
-            continue
-        labels = (device_name(device), room_name(device))
-        # Siblings of one Matter device share their series on purpose.
-        owner = relation_id(raw) or device.id
-        if labels in owners and owners[labels][0] != owner:
-            duplicate = (frozenset((owners[labels][1], device.id)), labels)
-            duplicates.add(duplicate)
-            if duplicate not in STATE.duplicates:
-                LOG.warning(
-                    "devices %s and %s are both named %r in room %r, so they share their "
-                    "series; give each device a unique name in its room",
-                    owners[labels][1],
-                    device.id,
-                    *labels,
-                )
-        owners[labels] = (owner, device.id)
-        _merge(samples, own)
-        counts[kind] = counts.get(kind, 0) + 1
-
-    publish(samples)
-    STATE.duplicates = duplicates
-    STATE.last_success = time.monotonic()
-    SCRAPE_SUCCESS.set(1)
-    LAST_SUCCESS.set(time.time())
+            # A motion that started between 2 polls while the event stream was
+            # down still counts once, if the sensor still reports it.
+            before = {raw["id"]: raw for raw in STATE.devices if _has_id(raw)}
+            placed = _placed(devices)
+            for raw in devices:
+                if _has_id(raw):
+                    _track_motion(before.get(raw["id"]), raw, placed)
+        except Exception as exc:  # noqa: BLE001 - counting must not stop the poll
+            LOG.warning("could not count motion in this poll: %s", exc)
+        # A copy: an event replaces an entry, and the list is the caller's.
+        STATE.devices = list(devices)
+        counts, skipped = _publish_devices(hub, temp_offset)
+        STATE.last_success = time.monotonic()
+        SCRAPE_SUCCESS.set(1)
+        LAST_SUCCESS.set(time.time())
     LOG.info(
         "polled %s%s",
         ", ".join(f"{count} {kind}(s)" for kind, count in counts.items()),
         f", skipped {skipped}" if skipped else "",
     )
     return sum(counts.values())
+
+
+def _has_id(raw) -> bool:
+    return isinstance(raw, dict) and isinstance(raw.get("id"), str)
+
+
+def handle_event(hub: Hub, message, temp_offset: float) -> None:
+    """Apply one message of the hub's event stream.
+
+    ``deviceStateChanged`` carries the attributes that changed. They are merged
+    into the device of the last poll, and the values are published again.
+    ``remotePressEvent`` is counted. Never raises: a message the exporter does
+    not understand is logged and dropped, and the next poll corrects the state.
+    """
+    try:
+        event = json.loads(message)
+        event_type = event.get("type") if isinstance(event, dict) else None
+        if not isinstance(event_type, str):
+            raise TypeError("no event type")
+        EVENTS.labels(event_type).inc()
+        data = event.get("data")
+        if not _has_id(data):
+            return
+        with _LOCK:
+            index = next(
+                (
+                    i
+                    for i, raw in enumerate(STATE.devices)
+                    if _has_id(raw) and raw["id"] == data["id"]
+                ),
+                None,
+            )
+            if index is None:
+                return  # A device the last poll did not list: the next poll adds it.
+            old = STATE.devices[index]
+            placed = _placed(STATE.devices)
+            if event_type == "remotePressEvent":
+                pattern = data.get("clickPattern")
+                pattern = pattern if isinstance(pattern, str) else "unknown"
+                REMOTE_PRESSES.labels(*raw_labels(old, placed), pattern).inc()
+            elif event_type == "deviceStateChanged":
+                new = {**old, **{k: v for k, v in data.items() if k != "attributes"}}
+                changed = data.get("attributes")
+                if isinstance(changed, dict):
+                    new["attributes"] = {**old.get("attributes", {}), **changed}
+                _track_motion(old, new, placed)
+                STATE.devices[index] = new
+                _publish_devices(hub, temp_offset, log=False)
+    except Exception as exc:  # noqa: BLE001 - one bad message must not stop the listener
+        LOG.warning("dropped an event from the hub: %s", exc)
+
+
+def listen(config: Config) -> None:  # pragma: no cover - infinite loop
+    """Listen to the hub's event stream for ever, and reconnect when it closes."""
+    # A Hub of its own: create_event_listener() keeps its connection on the Hub.
+    hub = Hub(token=config.token, ip_address=config.ip)
+    connected = [False]
+
+    def on_open(_ws) -> None:
+        EVENT_STREAM_CONNECTED.set(1)
+        if not connected[0]:
+            LOG.info("connected to the event stream of the hub")
+        connected[0] = True
+
+    def on_message(_ws, message) -> None:
+        handle_event(hub, message, config.temp_offset)
+
+    def on_error(_ws, error) -> None:
+        if connected[0]:
+            LOG.warning("event stream error: %s", error)
+
+    while True:
+        try:
+            # Returns when the connection closes. The hub closes an idle
+            # connection on its own, so a close is normal and is not logged.
+            hub.create_event_listener(on_open=on_open, on_message=on_message, on_error=on_error)
+        except Exception as exc:  # noqa: BLE001 - the listener must survive any hub error
+            if connected[0]:
+                LOG.warning("event stream stopped: %s", exc)
+            connected[0] = False
+        EVENT_STREAM_CONNECTED.set(0)
+        time.sleep(5)
 
 
 def run(hub: Hub, config: Config) -> None:  # pragma: no cover - infinite loop
@@ -552,6 +763,10 @@ def main() -> None:  # pragma: no cover - process wiring
         config.poll_interval,
         config.temp_offset,
     )
+
+    EVENT_STREAM_CONNECTED.set(0)
+    if config.event_stream:
+        threading.Thread(target=listen, args=(config,), name="events", daemon=True).start()
 
     hub = Hub(token=config.token, ip_address=config.ip)
     run(hub, config)

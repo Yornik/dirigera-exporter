@@ -31,9 +31,14 @@ remote control and motion sensor. It only reads: it never switches a device.
 | `ikea_light_color_temperature_kelvin` | `sensor`, `room` | Colour temperature the light is set to, in kelvin |
 | `ikea_motion_detected` | `sensor`, `room` | `1` if the motion sensor reports motion at the time of the poll, else `0` |
 | `ikea_illuminance_lux` | `sensor`, `room` | Illuminance at the light sensor of a motion sensor, in lux. The hub sends the Zigbee value `10000 × log10(lux) + 1`; the exporter converts it. `0` is too dark to measure |
+| `ikea_motion_detections_total` | `sensor`, `room` | Times the motion sensor started to report motion. A counter: use `increase()` |
+| `ikea_motion_last_detected_timestamp_seconds` | `sensor`, `room` | Unix time the motion sensor last started to report motion, since the exporter started |
+| `ikea_remote_presses_total` | `sensor`, `room`, `pattern` | Presses of a remote control, by click pattern (for example `singlePress`). A counter |
 | `ikea_dirigera_device_battery_percent` | `sensor`, `room` | Battery level of a remote control or motion sensor (0–100) |
 | `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the device, else `0` |
 | `ikea_dirigera_device_last_seen_timestamp_seconds` | `sensor`, `room` | Unix time the hub last heard from the device |
+| `ikea_dirigera_event_stream_connected` | — | `1` if the exporter is connected to the hub's event stream, else `0` |
+| `ikea_dirigera_events_total` | `type` | Events received from the hub, by event type |
 | `ikea_dirigera_scrape_success` | — | `1` if the most recent hub poll succeeded, else `0` |
 | `ikea_dirigera_last_success_timestamp_seconds` | — | Unix time of the most recent successful poll |
 
@@ -57,9 +62,9 @@ always current:
   name in its room. Two devices with the same name share their series: the
   exporter logs a warning once, and their health shows the worse of the two.
   Two lights with the same name show as on when either is on.
-- The hub is polled, so a motion that starts and ends between 2 polls is not
-  seen. With the default `POLL_INTERVAL_SECONDS` of 30, read
-  `ikea_motion_detected` as "motion at the time of the poll".
+- `ikea_motion_detected` is the state at the time Prometheus scrapes, so a
+  short motion between 2 scrapes does not show in it. To count every motion,
+  use `increase(ikea_motion_detections_total[1h])`.
 - A remote control has no position or level of its own. The hub reports only
   its battery and when it was last heard from. The brightness it sets shows on
   the lights.
@@ -72,6 +77,26 @@ always current:
   Without a room, the humidity half keeps the model name, so the humidity of
   several such sensors lands on 1 series.
 
+## Polls and events
+
+The exporter reads the hub in 2 ways.
+
+- **Poll:** every `POLL_INTERVAL_SECONDS` it asks the hub for all devices.
+  The poll is the source of truth.
+- **Event stream:** the hub pushes each change the moment it happens. The
+  exporter merges the change into the devices of the last poll and publishes
+  the values again, so a value on `/metrics` is as new as the last event. The
+  event stream also carries what a poll cannot see: each start of a motion, and
+  each press of a remote control.
+
+If the event stream stops, the exporter connects again after 5 seconds, and the
+poll goes on. `ikea_dirigera_event_stream_connected` shows the state. A motion
+that starts while the stream is down still counts once, if the sensor still
+reports it at the next poll. A press of a remote control in that time is lost.
+The counters start at 0 when the exporter starts.
+
+Set `EVENT_STREAM=false` to only poll.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -81,6 +106,7 @@ always current:
 | `POLL_INTERVAL_SECONDS` | `30` | Seconds between polls |
 | `TEMP_OFFSET_CELSIUS` | `0.0` | Offset added to the **temperature** gauge only. The ALPSTUGA tends to read a couple of degrees warm; set to e.g. `-2` to compensate. |
 | `LISTEN_PORT` | `9119` | Port the `/metrics` endpoint listens on |
+| `EVENT_STREAM` | `true` | Listen to the hub's event stream. Set to `false` to only poll |
 
 ## Getting a hub token
 
