@@ -563,9 +563,15 @@ def _publish_devices(hub: Hub, temp_offset: float, log: bool = True) -> tuple[di
                 device = _SIMPLE_KINDS[kind][0](raw, hub)
                 simple_samples(device, kind, own)
             labels = (device_name(device), room_name(device))
-            last_motion = STATE.last_motion.get(device.id)
-            if kind == "motion sensor" and last_motion is not None:
-                _add(own, MOTION_LAST, labels, last_motion)
+            # A counter that first appears at 1 loses that step in increase().
+            # So each counter starts at 0 as soon as the device is known.
+            if kind == "motion sensor":
+                MOTION_DETECTIONS.labels(*labels)
+                last_motion = STATE.last_motion.get(device.id)
+                if last_motion is not None:
+                    _add(own, MOTION_LAST, labels, last_motion)
+            elif kind == "remote":
+                REMOTE_PRESSES.labels(*labels, "singlePress")
         except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
             skipped += 1
             if log:

@@ -864,7 +864,8 @@ def test_motion_event_is_counted_and_timed(monkeypatch):
     monkeypatch.setattr(ex.time, "time", lambda: 1_800_000_000.0)
     hub = FakeHub(others=make_motion_sensor(detected=False))
     ex.poll_once(hub, temp_offset=0.0)
-    assert value("ikea_motion_detections_total", **HALL) is None
+    # The counter is there at 0 before the first motion, so increase() sees the first step.
+    assert value("ikea_motion_detections_total", **HALL) == 0
     assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) is None
 
     ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
@@ -905,7 +906,7 @@ def test_motion_between_polls_counts_without_the_event_stream():
 def test_motion_at_the_first_poll_is_timed_but_not_counted():
     ex.poll_once(FakeHub(others=make_motion_sensor(detected=True)), temp_offset=0.0)
 
-    assert value("ikea_motion_detections_total", **HALL) is None
+    assert value("ikea_motion_detections_total", **HALL) == 0
     assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) is not None
 
 
@@ -933,6 +934,7 @@ def test_illuminance_event_is_converted_to_lux():
 def test_remote_press_is_counted_by_pattern():
     hub = FakeHub(others=make_remote())
     ex.poll_once(hub, temp_offset=0.0)
+    assert value("ikea_remote_presses_total", pattern="singlePress", **WHEEL) == 0
 
     # A press comes from any of the 3 entries of the wheel.
     ex.handle_event(hub, remote_press("wheel_3"), 0.0)
