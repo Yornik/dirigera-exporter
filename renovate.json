@@ -34,12 +34,9 @@
       "automerge": true
     },
     {
-      "description": "The dirigera library moves with the hub firmware. The tests run every device kind through its real parsers, so a green CI is the check.",
+      "description": "Python packages: dirigera, prometheus-client, pytest and ruff. The tests run every device kind through the real parsers of dirigera, and CI runs ruff, so a green CI is the check.",
       "matchDatasources": [
         "pypi"
-      ],
-      "matchPackageNames": [
-        "dirigera"
       ],
       "matchUpdateTypes": [
         "minor",
