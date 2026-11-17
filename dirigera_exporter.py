@@ -392,8 +392,9 @@ def zigbee_illuminance_to_lux(measured: float) -> float:
     """Convert the hub's illuminance to lux.
 
     The hub passes on the Zigbee "MeasuredValue", which is 10000 * log10(lux) + 1,
-    and 0 for "too dark to measure". A live VALLHORN read 7781 in a hall at night
-    with the lights on: that is 6 lux as a Zigbee value, and cannot be 7781 lux.
+    and 0 for "too dark to measure". This is inferred, not documented by IKEA: a
+    live VALLHORN in an entrance hall read 7781 at midday in November. That is
+    6 lux as a Zigbee value. 7781 lux would be direct sunlight.
     """
     measured = float(measured)
     return 0.0 if measured <= 0 else 10 ** ((measured - 1) / 10000)
