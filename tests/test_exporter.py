@@ -644,7 +644,9 @@ def make_remote(relation="wheel", name="Wheel", room="Bedroom", battery=86, reac
     return entries
 
 
-def make_motion_sensor(relation="motion", name="Hall sensor", room="Entrance", detected=False):
+def make_motion_sensor(
+    relation="motion", name="Hall sensor", room="Entrance", detected=False, illuminance=7781
+):
     """The 2 entries of 1 VALLHORN: the motion sensor, and a light sensor with no name."""
     motion_attrs = {
         "customName": name,
@@ -655,7 +657,7 @@ def make_motion_sensor(relation="motion", name="Hall sensor", room="Entrance", d
         "sensorConfig": {"onDuration": 180, "scheduleOn": False},
     }
     motion = _device(f"{relation}_1", "sensor", "motionSensor", motion_attrs, room, True, LAST_SEEN)
-    light_attrs = {"customName": "", "illuminance": 12}
+    light_attrs = {"customName": "", "illuminance": illuminance}
     light = _device(f"{relation}_3", "unknown", "lightSensor", light_attrs, None, True, LAST_SEEN)
     motion["relationId"] = light["relationId"] = relation
     return [motion, light]
@@ -734,7 +736,8 @@ def test_motion_sensor_and_its_light_sensor_share_name_and_room(caplog):
     hall = {"sensor": "Hall sensor", "room": "Entrance"}
     assert count == 2
     assert value("ikea_motion_detected", **hall) == 1
-    assert value("ikea_illuminance_lux", **hall) == 12
+    # 7781 is a Zigbee value: 10000 * log10(lux) + 1.
+    assert value("ikea_illuminance_lux", **hall) == pytest.approx(6.0, abs=0.01)
     assert value("ikea_dirigera_device_battery_percent", **hall) == 97
     # The motion sensor has an "isOn" of its own. It is not a light.
     assert value("ikea_light_on", **hall) is None
@@ -786,3 +789,11 @@ def test_duplicate_name_is_logged_once_until_it_changes(caplog):
     ex.poll_once(FakeHub(others=lights[:1]), temp_offset=0.0)
     ex.poll_once(FakeHub(others=lights), temp_offset=0.0)
     assert caplog.text.count("are both named 'Lamp'") == 2
+
+
+@pytest.mark.parametrize(("measured", "lux"), [(0, 0.0), (1, 1.0), (10001, 10.0), (30001, 1000.0)])
+def test_illuminance_is_converted_from_the_zigbee_value(measured, lux):
+    ex.poll_once(FakeHub(others=make_motion_sensor(illuminance=measured)), temp_offset=0.0)
+
+    hall = {"sensor": "Hall sensor", "room": "Entrance"}
+    assert value("ikea_illuminance_lux", **hall) == pytest.approx(lux)

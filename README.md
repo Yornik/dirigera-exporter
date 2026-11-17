@@ -30,7 +30,7 @@ remote control and motion sensor. It only reads: it never switches a device.
 | `ikea_light_level_percent` | `sensor`, `room` | Brightness the light is set to (1–100). A light that is off keeps its last level |
 | `ikea_light_color_temperature_kelvin` | `sensor`, `room` | Colour temperature the light is set to, in kelvin |
 | `ikea_motion_detected` | `sensor`, `room` | `1` if the motion sensor reports motion at the time of the poll, else `0` |
-| `ikea_illuminance_lux` | `sensor`, `room` | Illuminance at the light sensor of a motion sensor, as the hub reports it |
+| `ikea_illuminance_lux` | `sensor`, `room` | Illuminance at the light sensor of a motion sensor, in lux. The hub sends the Zigbee value `10000 × log10(lux) + 1`; the exporter converts it. `0` is too dark to measure |
 | `ikea_dirigera_device_battery_percent` | `sensor`, `room` | Battery level of a remote control or motion sensor (0–100) |
 | `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the device, else `0` |
 | `ikea_dirigera_device_last_seen_timestamp_seconds` | `sensor`, `room` | Unix time the hub last heard from the device |

@@ -26,7 +26,6 @@ instead of keeping their last value.
 
 from __future__ import annotations
 
-import datetime
 import logging
 import os
 import sys
@@ -36,7 +35,11 @@ import warnings
 import urllib3
 from dirigera import Hub
 from dirigera.devices.air_purifier import AirPurifier, FanModeEnum, dict_to_air_purifier
+from dirigera.devices.controller import dict_to_controller
 from dirigera.devices.environment_sensor import EnvironmentSensor, dict_to_environment_sensor
+from dirigera.devices.light import dict_to_light
+from dirigera.devices.light_sensor import dict_to_light_sensor
+from dirigera.devices.motion_sensor import dict_to_motion_sensor
 from prometheus_client import Gauge, start_http_server
 
 LOG = logging.getLogger("dirigera-exporter")
@@ -119,7 +122,7 @@ MOTION_DETECTED = Gauge(
 )
 ILLUMINANCE = Gauge(
     "ikea_illuminance_lux",
-    "Illuminance at the light sensor, as the hub reports it.",
+    "Illuminance at the light sensor in lux, converted from the hub's Zigbee value.",
     _LABELS,
 )
 
@@ -364,51 +367,48 @@ def purifier_samples(purifier: AirPurifier, samples: Samples) -> None:
         _add(samples, PURIFIER_PM25, labels, attrs.current_p_m25)
 
 
-def raw_labels(raw: dict) -> tuple[str, str]:
-    """Name and room of a device that is read from the raw hub entry."""
-    name = raw["attributes"].get("customName") or raw["id"]
-    room = raw.get("room")
-    return (name, (room.get("name") if isinstance(room, dict) else None) or "unknown")
-
-
-def _raw_health_samples(raw: dict, samples: Samples) -> bool:
-    """Like ``_health_samples``, for a device that is read from the raw hub entry."""
-    labels = raw_labels(raw)
-    reachable = bool(raw.get("isReachable", True))
-    _add(samples, DEVICE_REACHABLE, labels, 1 if reachable else 0)
-    last_seen = raw.get("lastSeen")
-    if last_seen is not None:
-        # fromisoformat() reads the hub's trailing "Z" from Python 3.11 on.
-        seen = datetime.datetime.fromisoformat(last_seen)
-        _add(samples, DEVICE_LAST_SEEN, labels, seen.timestamp())
-    return reachable
-
-
-# What each kind of device publishes: attribute of the hub entry -> gauge. The
-# dirigera library has no model for a Matter remote ("genericSwitch") and marks
-# the light sensor of a motion sensor as type "unknown", so these kinds are read
-# from the raw entry. A missing attribute publishes nothing.
-_RAW_ATTRIBUTES: dict[str, dict[str, Gauge]] = {
-    "light": {
-        "isOn": LIGHT_ON,
-        "lightLevel": LIGHT_LEVEL,
-        "colorTemperature": LIGHT_COLOR_TEMPERATURE,
-    },
-    "motion sensor": {"isDetected": MOTION_DETECTED, "batteryPercentage": DEVICE_BATTERY},
-    "light sensor": {"illuminance": ILLUMINANCE},
-    "remote": {"batteryPercentage": DEVICE_BATTERY},
+# What the other kinds of device publish: the library's parser, and attribute
+# of its model -> gauge. An attribute the hub did not send publishes nothing.
+# A motion sensor has an "is_on" of its own; it is not a light and is not read.
+_SIMPLE_KINDS: dict[str, tuple] = {
+    "light": (
+        dict_to_light,
+        {
+            "is_on": LIGHT_ON,
+            "light_level": LIGHT_LEVEL,
+            "color_temperature": LIGHT_COLOR_TEMPERATURE,
+        },
+    ),
+    "motion sensor": (
+        dict_to_motion_sensor,
+        {"is_detected": MOTION_DETECTED, "battery_percentage": DEVICE_BATTERY},
+    ),
+    "light sensor": (dict_to_light_sensor, {"illuminance": ILLUMINANCE}),
+    "remote": (dict_to_controller, {"battery_percentage": DEVICE_BATTERY}),
 }
 
 
-def raw_samples(raw: dict, kind: str, samples: Samples) -> None:
+def zigbee_illuminance_to_lux(measured: float) -> float:
+    """Convert the hub's illuminance to lux.
+
+    The hub passes on the Zigbee "MeasuredValue", which is 10000 * log10(lux) + 1,
+    and 0 for "too dark to measure". A live VALLHORN read 7781 in a hall at night
+    with the lights on: that is 6 lux as a Zigbee value, and cannot be 7781 lux.
+    """
+    measured = float(measured)
+    return 0.0 if measured <= 0 else 10 ** ((measured - 1) / 10000)
+
+
+def simple_samples(device, kind: str, samples: Samples) -> None:
     """Add the state of one light, motion sensor, light sensor or remote."""
-    if not _raw_health_samples(raw, samples):
+    if not _health_samples(device, samples):
         return
-    labels = raw_labels(raw)
-    attrs = raw["attributes"]
-    for attribute, gauge in _RAW_ATTRIBUTES[kind].items():
-        val = attrs.get(attribute)
+    labels = (device_name(device), room_name(device))
+    for attribute, gauge in _SIMPLE_KINDS[kind][1].items():
+        val = getattr(device.attributes, attribute, None)
         if val is not None:
+            if gauge is ILLUMINANCE:
+                val = zigbee_illuminance_to_lux(val)
             _add(samples, gauge, labels, val)
 
 
@@ -480,32 +480,31 @@ def poll_once(hub: Hub, temp_offset: float, stale_after: float = 90.0) -> int | 
             if kind == "environment sensor":
                 device = dict_to_environment_sensor(raw, hub)
                 sensor_samples(device, temp_offset, own)
-                labels, device_id = (device_name(device), room_name(device)), device.id
             elif kind == "air purifier":
                 device = dict_to_air_purifier(raw, hub)
                 purifier_samples(device, own)
-                labels, device_id = (device_name(device), room_name(device)), device.id
             else:
-                raw_samples(raw, kind, own)
-                labels, device_id = raw_labels(raw), str(raw["id"])
+                device = _SIMPLE_KINDS[kind][0](raw, hub)
+                simple_samples(device, kind, own)
         except Exception as exc:  # noqa: BLE001 - one bad device must not stop the poll
             skipped += 1
             LOG.warning("skipped device %s: %s", raw.get("id", "?"), exc)
             continue
+        labels = (device_name(device), room_name(device))
         # Siblings of one Matter device share their series on purpose.
-        owner = relation_id(raw) or device_id
+        owner = relation_id(raw) or device.id
         if labels in owners and owners[labels][0] != owner:
-            duplicate = (frozenset((owners[labels][1], device_id)), labels)
+            duplicate = (frozenset((owners[labels][1], device.id)), labels)
             duplicates.add(duplicate)
             if duplicate not in STATE.duplicates:
                 LOG.warning(
                     "devices %s and %s are both named %r in room %r, so they share their "
                     "series; give each device a unique name in its room",
                     owners[labels][1],
-                    device_id,
+                    device.id,
                     *labels,
                 )
-        owners[labels] = (owner, device_id)
+        owners[labels] = (owner, device.id)
         _merge(samples, own)
         counts[kind] = counts.get(kind, 0) + 1
 
