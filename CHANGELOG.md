@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 (2026-11-17)
+
+## What's Changed
+* feat: listen to the hub's event stream; count motions and remote presses by @Yornik in https://github.com/Yornik/dirigera-exporter/pull/37
+* feat: number the rooms and export their icon and color by @Yornik in https://github.com/Yornik/dirigera-exporter/pull/39
+
+
+**Full Changelog**: https://github.com/Yornik/dirigera-exporter/compare/v0.5.0...v0.6.0
+
 ## 0.5.0 (2026-11-17)
 
 ## What's Changed
