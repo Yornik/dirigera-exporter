@@ -32,6 +32,20 @@
         "patch"
       ],
       "automerge": true
+    },
+    {
+      "description": "The dirigera library moves with the hub firmware. The tests run every device kind through its real parsers, so a green CI is the check.",
+      "matchDatasources": [
+        "pypi"
+      ],
+      "matchPackageNames": [
+        "dirigera"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
     }
   ],
   "semanticCommits": "enabled",
