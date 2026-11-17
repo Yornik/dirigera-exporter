@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 (2026-11-17)
+
+## What's Changed
+* feat: export lights, motion sensors, light sensors and remote batteries by @Yornik in https://github.com/Yornik/dirigera-exporter/pull/35
+* chore(deps): update dependency dirigera to v1.6.1 by @renovate[bot] in https://github.com/Yornik/dirigera-exporter/pull/27
+* chore(deps): update dependency prometheus-client to v0.26.0 by @renovate[bot] in https://github.com/Yornik/dirigera-exporter/pull/25
+* chore(deps): update dependency ruff to v0.17.5 by @renovate[bot] in https://github.com/Yornik/dirigera-exporter/pull/24
+* chore(deps): update dependency pytest to v9.2.0 by @renovate[bot] in https://github.com/Yornik/dirigera-exporter/pull/16
+
+
+**Full Changelog**: https://github.com/Yornik/dirigera-exporter/compare/v0.4.1...v0.5.0
+
 ## 0.4.1 (2026-11-16)
 
 ## What's Changed
