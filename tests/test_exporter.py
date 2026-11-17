@@ -7,6 +7,7 @@ through the dirigera library's real device parsers. No live hub is required.
 from __future__ import annotations
 
 import datetime
+import json
 
 import pytest
 from dirigera.hub.abstract_smart_home_hub import AbstractSmartHomeHub
@@ -123,8 +124,8 @@ class FakeHub(AbstractSmartHomeHub):
 
 @pytest.fixture(autouse=True)
 def _reset_metrics(monkeypatch):
-    for gauge in ex.DEVICE_GAUGES:
-        gauge.clear()
+    for metric in (*ex.DEVICE_GAUGES, ex.MOTION_DETECTIONS, ex.REMOTE_PRESSES, ex.EVENTS):
+        metric.clear()
     monkeypatch.setattr(ex, "STATE", ex._State())
     ex.SCRAPE_SUCCESS.set(0)
     ex.LAST_SUCCESS.set(0)
@@ -797,3 +798,219 @@ def test_illuminance_is_converted_from_the_zigbee_value(measured, lux):
 
     hall = {"sensor": "Hall sensor", "room": "Entrance"}
     assert value("ikea_illuminance_lux", **hall) == pytest.approx(lux)
+
+
+# --- the event stream ---
+# The event shapes below are those of a live hub.
+
+
+def state_changed(device_id, attributes=None, **data):
+    """A deviceStateChanged message, as the hub sends it."""
+    payload = {"id": device_id, **data}
+    if attributes is not None:
+        payload["attributes"] = attributes
+    return json.dumps(
+        {
+            "id": "event-1",
+            "source": "urn:lpgera:dirigera",
+            "specversion": "1.1.0",
+            "time": "2026-11-17T13:09:16.000Z",
+            "type": "deviceStateChanged",
+            "data": payload,
+        }
+    )
+
+
+def remote_press(device_id, pattern="singlePress"):
+    data = {"id": device_id, "clickPattern": pattern}
+    return json.dumps({"id": "event-2", "type": "remotePressEvent", "data": data})
+
+
+HALL = {"sensor": "Hall sensor", "room": "Entrance"}
+LAMP = {"sensor": "Lamp", "room": "Bedroom"}
+WHEEL = {"sensor": "Wheel", "room": "Bedroom"}
+
+
+def test_event_updates_a_light_between_polls():
+    hub = FakeHub(others=[make_light(on=False, level=40)])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    ex.handle_event(hub, state_changed("light-1", {"isOn": True}), 0.0)
+    assert value("ikea_light_on", **LAMP) == 1
+    # An event carries only what changed. The rest stays.
+    assert value("ikea_light_level_percent", **LAMP) == 40
+
+    ex.handle_event(hub, state_changed("light-1", {"lightLevel": 7}), 0.0)
+    assert value("ikea_light_level_percent", **LAMP) == 7
+    assert value("ikea_dirigera_events_total", type="deviceStateChanged") == 2
+    # The exporter did not ask the hub again.
+    assert hub.requests == ["/devices"]
+
+
+def test_event_without_attributes_changes_reachability():
+    hub = FakeHub(others=[make_light()])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    ex.handle_event(hub, state_changed("light-1", isReachable=False), 0.0)
+    assert value("ikea_dirigera_device_reachable", **LAMP) == 0
+    assert value("ikea_light_on", **LAMP) is None
+
+    ex.handle_event(hub, state_changed("light-1", isReachable=True), 0.0)
+    assert value("ikea_dirigera_device_reachable", **LAMP) == 1
+    assert value("ikea_light_on", **LAMP) == 1
+
+
+def test_motion_event_is_counted_and_timed(monkeypatch):
+    monkeypatch.setattr(ex.time, "time", lambda: 1_800_000_000.0)
+    hub = FakeHub(others=make_motion_sensor(detected=False))
+    ex.poll_once(hub, temp_offset=0.0)
+    assert value("ikea_motion_detections_total", **HALL) is None
+    assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) is None
+
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
+    assert value("ikea_motion_detected", **HALL) == 1
+    assert value("ikea_motion_detections_total", **HALL) == 1
+    assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) == 1_800_000_000.0
+
+    # The hub repeats the state: that is not a new motion.
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
+    assert value("ikea_motion_detections_total", **HALL) == 1
+
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": False}), 0.0)
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
+    assert value("ikea_motion_detections_total", **HALL) == 2
+
+
+def test_motion_seen_by_a_poll_and_an_event_counts_once():
+    quiet, moving = make_motion_sensor(detected=False), make_motion_sensor(detected=True)
+    hub = FakeHub(others=quiet)
+    ex.poll_once(hub, temp_offset=0.0)
+
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
+    hub.devices = moving
+    ex.poll_once(hub, temp_offset=0.0)
+    assert value("ikea_motion_detections_total", **HALL) == 1
+
+
+def test_motion_between_polls_counts_without_the_event_stream():
+    hub = FakeHub(others=make_motion_sensor(detected=False))
+    ex.poll_once(hub, temp_offset=0.0)
+    hub.devices = make_motion_sensor(detected=True)
+    ex.poll_once(hub, temp_offset=0.0)
+
+    assert value("ikea_motion_detections_total", **HALL) == 1
+    assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) is not None
+
+
+def test_motion_at_the_first_poll_is_timed_but_not_counted():
+    ex.poll_once(FakeHub(others=make_motion_sensor(detected=True)), temp_offset=0.0)
+
+    assert value("ikea_motion_detections_total", **HALL) is None
+    assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) is not None
+
+
+def test_last_motion_time_stays_after_the_motion_ends():
+    hub = FakeHub(others=make_motion_sensor(detected=False))
+    ex.poll_once(hub, temp_offset=0.0)
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": True}), 0.0)
+    seen = value("ikea_motion_last_detected_timestamp_seconds", **HALL)
+
+    ex.handle_event(hub, state_changed("motion_1", {"isDetected": False}), 0.0)
+    ex.poll_once(hub, temp_offset=0.0)
+    assert value("ikea_motion_detected", **HALL) == 0
+    assert value("ikea_motion_last_detected_timestamp_seconds", **HALL) == seen
+
+
+def test_illuminance_event_is_converted_to_lux():
+    hub = FakeHub(others=make_motion_sensor())
+    ex.poll_once(hub, temp_offset=0.0)
+
+    # The light sensor has no name of its own: the event still lands on its sibling.
+    ex.handle_event(hub, state_changed("motion_3", {"illuminance": 10001}), 0.0)
+    assert value("ikea_illuminance_lux", **HALL) == pytest.approx(10.0)
+
+
+def test_remote_press_is_counted_by_pattern():
+    hub = FakeHub(others=make_remote())
+    ex.poll_once(hub, temp_offset=0.0)
+
+    # A press comes from any of the 3 entries of the wheel.
+    ex.handle_event(hub, remote_press("wheel_3"), 0.0)
+    ex.handle_event(hub, remote_press("wheel_6"), 0.0)
+    ex.handle_event(hub, remote_press("wheel_3", "longPress"), 0.0)
+
+    assert value("ikea_remote_presses_total", pattern="singlePress", **WHEEL) == 2
+    assert value("ikea_remote_presses_total", pattern="longPress", **WHEEL) == 1
+    assert value("ikea_dirigera_events_total", type="remotePressEvent") == 3
+
+
+def test_event_for_an_unknown_device_is_ignored():
+    hub = FakeHub(others=[make_light()])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    ex.handle_event(hub, state_changed("light-99", {"isOn": False}), 0.0)
+    ex.handle_event(hub, remote_press("wheel-99"), 0.0)
+    assert value("ikea_light_on", **LAMP) == 1
+    assert value("ikea_dirigera_events_total", type="deviceStateChanged") == 1
+
+
+def test_event_before_the_first_poll_is_ignored():
+    ex.handle_event(FakeHub(), state_changed("light-1", {"isOn": True}), 0.0)
+    assert value("ikea_light_on", **LAMP) is None
+
+
+@pytest.mark.parametrize(
+    "message", ["not json", "[]", "{}", "42", '{"type": 7}', '{"type": "x", "data": []}', b"\xff"]
+)
+def test_bad_event_is_dropped_and_the_values_stay(message):
+    hub = FakeHub(others=[make_light()])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    ex.handle_event(hub, message, 0.0)
+    assert value("ikea_light_on", **LAMP) == 1
+
+
+def test_event_with_a_bad_value_does_not_remove_the_other_devices(caplog):
+    hub = FakeHub([make_sensor()], others=[make_light()])
+    ex.poll_once(hub, temp_offset=0.0)
+    caplog.clear()
+
+    ex.handle_event(hub, state_changed("light-1", {"lightLevel": "bright"}), 0.0)
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+    # The light drops out until the next poll corrects it. The rebuild is quiet.
+    assert value("ikea_light_on", **LAMP) is None
+    assert "skipped device" not in caplog.text
+
+    ex.poll_once(hub, temp_offset=0.0)
+    assert value("ikea_light_on", **LAMP) == 1
+
+
+def test_event_after_the_values_went_stale_does_not_publish_old_values(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(ex.time, "monotonic", lambda: clock[0])
+    hub = FakeHub(others=[make_light()])
+    ex.poll_once(hub, temp_offset=0.0)
+
+    hub.error = RuntimeError("hub down")
+    clock[0] += 91
+    ex.poll_once(hub, temp_offset=0.0, stale_after=90.0)
+    assert value("ikea_light_on", **LAMP) is None
+
+    ex.handle_event(hub, state_changed("light-1", {"isOn": False}), 0.0)
+    assert value("ikea_light_on", **LAMP) is None
+
+
+def test_event_does_not_repeat_the_duplicate_name_warning(caplog):
+    hub = FakeHub(others=[make_light(light_id="a"), make_light(light_id="b")])
+    ex.poll_once(hub, temp_offset=0.0)
+    ex.handle_event(hub, state_changed("a", {"isOn": False}), 0.0)
+    ex.poll_once(hub, temp_offset=0.0)
+
+    assert caplog.text.count("are both named 'Lamp'") == 1
+
+
+def test_event_stream_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("EVENT_STREAM", "false")
+    assert ex.Config().event_stream is False
+    monkeypatch.delenv("EVENT_STREAM")
+    assert ex.Config().event_stream is True
