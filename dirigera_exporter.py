@@ -170,6 +170,22 @@ DEVICE_LAST_SEEN = Gauge(
     _LABELS,
 )
 
+# --- rooms ---
+ROOM_INFO = Gauge(
+    "ikea_dirigera_room_info",
+    "1 for each room that holds a device. The icon and the color are those picked in the "
+    "IKEA Home smart app. The name of a room is free text; the icon is from a fixed set, "
+    "so a dashboard can tell the kind of a room by it.",
+    ("room", "icon", "color"),
+)
+ROOM_ORDER = Gauge(
+    "ikea_dirigera_room_order",
+    "A number for each room that holds a device: 1 for the room with the oldest device, "
+    "2 for the next. No 2 rooms share a number, so a dashboard can give each room a line "
+    "style of its own, whatever its name or icon. A new room gets the highest number.",
+    ("room",),
+)
+
 # Every gauge with per-device series. publish() keeps each of them equal to the
 # latest poll.
 DEVICE_GAUGES = (
@@ -191,6 +207,8 @@ DEVICE_GAUGES = (
     DEVICE_BATTERY,
     DEVICE_REACHABLE,
     DEVICE_LAST_SEEN,
+    ROOM_INFO,
+    ROOM_ORDER,
 )
 
 # --- global scrape-health gauges (no labels) ---
@@ -524,6 +542,34 @@ def _track_motion(old: dict | None, new: dict, placed: dict[str, dict]) -> None:
         MOTION_DETECTIONS.labels(*raw_labels(new, placed)).inc()
 
 
+def _room_samples(devices: list, samples: Samples) -> None:
+    """Add the info and the order number of each room that holds a device.
+
+    Every device counts, also a kind the exporter does not read. Rooms are
+    ordered by their oldest device, so a room keeps its number when a newer room
+    is added. 2 rooms with one name are 1 room here, as in every other series.
+    """
+    oldest: dict[str, tuple[str, str]] = {}
+    for raw in devices:
+        room = raw.get("room") if isinstance(raw, dict) else None
+        if not (isinstance(room, dict) and isinstance(room.get("name"), str) and room["name"]):
+            continue
+        name, icon, color = room["name"], room.get("icon"), room.get("color")
+        created = raw.get("createdAt")
+        key = (created if isinstance(created, str) else "9999", str(room.get("id", "")))
+        if name not in oldest:
+            labels = (
+                name,
+                icon if isinstance(icon, str) else "",
+                color if isinstance(color, str) else "",
+            )
+            samples.setdefault(ROOM_INFO, {})[labels] = 1.0
+        if name not in oldest or key < oldest[name]:
+            oldest[name] = key
+    for number, name in enumerate(sorted(oldest, key=lambda room: (oldest[room], room)), start=1):
+        samples.setdefault(ROOM_ORDER, {})[(name,)] = float(number)
+
+
 def _publish_devices(hub: Hub, temp_offset: float, log: bool = True) -> tuple[dict[str, int], int]:
     """Publish the values of ``STATE.devices``.
 
@@ -593,6 +639,8 @@ def _publish_devices(hub: Hub, temp_offset: float, log: bool = True) -> tuple[di
         owners[labels] = (owner, device.id)
         _merge(samples, own)
         counts[kind] = counts.get(kind, 0) + 1
+
+    _room_samples(devices, samples)
 
     publish(samples)
     if log:

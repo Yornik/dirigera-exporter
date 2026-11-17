@@ -1016,3 +1016,109 @@ def test_event_stream_can_be_switched_off(monkeypatch):
     assert ex.Config().event_stream is False
     monkeypatch.delenv("EVENT_STREAM")
     assert ex.Config().event_stream is True
+
+
+# --- rooms ---
+
+
+def test_room_info_carries_the_icon_and_the_color():
+    bedroom = make_sensor(room="Bedroom")
+    bedroom["room"].update(icon="rooms_bed", color="ikea_yellow_no_24")
+    ex.poll_once(FakeHub([bedroom, make_sensor(sensor_id="s2")]), temp_offset=0.0)
+
+    assert (
+        value(
+            "ikea_dirigera_room_info", room="Bedroom", icon="rooms_bed", color="ikea_yellow_no_24"
+        )
+        == 1
+    )
+    living = {"room": "Living room", "icon": "rooms_sofa", "color": "ikea_green_no_65"}
+    assert value("ikea_dirigera_room_info", **living) == 1
+
+
+def test_room_of_a_device_the_exporter_does_not_read_is_listed():
+    blind = _device(
+        "blind-1", "blinds", "blinds", {"customName": "Blind"}, "Attic", True, LAST_SEEN
+    )
+    ex.poll_once(FakeHub(others=[blind]), temp_offset=0.0)
+
+    assert (
+        value("ikea_dirigera_room_info", room="Attic", icon="rooms_sofa", color="ikea_green_no_65")
+        == 1
+    )
+
+
+def test_device_without_a_room_adds_no_room():
+    ex.poll_once(FakeHub([make_sensor(room=None)]), temp_offset=0.0)
+
+    assert not [s for m in ex.ROOM_INFO.collect() for s in m.samples]
+
+
+@pytest.mark.parametrize(
+    "room", ["Attic", 7, {"name": 7}, {"name": ""}, {"name": "Attic", "icon": 3}]
+)
+def test_badly_described_room_does_not_stop_the_poll(room):
+    blind = _device("blind-1", "blinds", "blinds", {"customName": "Blind"}, None, True, LAST_SEEN)
+    blind["room"] = room
+    assert ex.poll_once(FakeHub([make_sensor()], others=[blind]), temp_offset=0.0) == 1
+    assert value("ikea_air_temperature_celsius", **LIVING) == 21.0
+    if isinstance(room, dict) and room.get("name") == "Attic":
+        assert value("ikea_dirigera_room_info", room="Attic", icon="", color="") == 1
+
+
+def test_room_that_is_renamed_drops_its_old_name():
+    hub = FakeHub([make_sensor(room="Study")])
+    ex.poll_once(hub, temp_offset=0.0)
+    hub.devices = [make_sensor(room="Office")]
+    ex.poll_once(hub, temp_offset=0.0)
+
+    rooms = {s.labels["room"] for m in ex.ROOM_INFO.collect() for s in m.samples}
+    assert rooms == {"Office"}
+
+
+def _in_room(sensor_id, room, created):
+    raw = make_sensor(sensor_id=sensor_id, room=room, name=sensor_id)
+    raw["createdAt"] = created
+    return raw
+
+
+def test_rooms_are_numbered_by_their_oldest_device():
+    hub = FakeHub(
+        [
+            _in_room("a", "Office", "2026-03-01T00:00:00.000Z"),
+            _in_room("b", "Bedroom", "2026-01-01T00:00:00.000Z"),
+            _in_room("c", "Office", "2025-12-01T00:00:00.000Z"),
+            _in_room("d", "Attic", "2026-02-01T00:00:00.000Z"),
+        ]
+    )
+    ex.poll_once(hub, temp_offset=0.0)
+
+    order = {s.labels["room"]: s.value for m in ex.ROOM_ORDER.collect() for s in m.samples}
+    assert order == {"Office": 1, "Bedroom": 2, "Attic": 3}
+
+
+def test_new_room_gets_the_highest_number_and_the_others_keep_theirs():
+    devices = [
+        _in_room("a", "Bedroom", "2026-01-01T00:00:00.000Z"),
+        _in_room("b", "Office", "2026-02-01T00:00:00.000Z"),
+    ]
+    hub = FakeHub(devices)
+    ex.poll_once(hub, temp_offset=0.0)
+    hub.devices = [*devices, _in_room("c", "Attic", "2026-06-01T00:00:00.000Z")]
+    ex.poll_once(hub, temp_offset=0.0)
+
+    order = {s.labels["room"]: s.value for m in ex.ROOM_ORDER.collect() for s in m.samples}
+    assert order == {"Bedroom": 1, "Office": 2, "Attic": 3}
+
+
+def test_two_rooms_with_one_icon_get_different_numbers():
+    hub = FakeHub(
+        [
+            _in_room("a", "Bedroom", "2026-01-01T00:00:00.000Z"),
+            _in_room("b", "Kids bedroom", "2026-01-02T00:00:00.000Z"),
+        ]
+    )
+    ex.poll_once(hub, temp_offset=0.0)
+
+    assert value("ikea_dirigera_room_order", room="Bedroom") == 1
+    assert value("ikea_dirigera_room_order", room="Kids bedroom") == 2

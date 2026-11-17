@@ -35,6 +35,8 @@ remote control and motion sensor. It only reads: it never switches a device.
 | `ikea_motion_last_detected_timestamp_seconds` | `sensor`, `room` | Unix time the motion sensor last started to report motion, since the exporter started |
 | `ikea_remote_presses_total` | `sensor`, `room`, `pattern` | Presses of a remote control, by click pattern (for example `singlePress`). A counter |
 | `ikea_dirigera_device_battery_percent` | `sensor`, `room` | Battery level of a remote control or motion sensor (0–100) |
+| `ikea_dirigera_room_info` | `room`, `icon`, `color` | `1` for each room that holds a device, with the icon and the color picked in the IKEA Home smart app. The name of a room is free text; the icon is from a fixed set. Join it with `and on(room)` to select rooms by kind |
+| `ikea_dirigera_room_order` | `room` | A number for each room that holds a device: `1` for the room with the oldest device. No 2 rooms share a number, so a dashboard can give each room a line style of its own, whatever its name or icon. A new room gets the highest number |
 | `ikea_dirigera_device_reachable` | `sensor`, `room` | `1` if the hub can reach the device, else `0` |
 | `ikea_dirigera_device_last_seen_timestamp_seconds` | `sensor`, `room` | Unix time the hub last heard from the device |
 | `ikea_dirigera_event_stream_connected` | — | `1` if the exporter is connected to the hub's event stream, else `0` |
