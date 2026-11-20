@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1 (2026-11-20)
+
+## What's Changed
+* chore(deps): update dependency ruff to v0.17.6 by @renovate[bot] in https://github.com/Yornik/dirigera-exporter/pull/40
+
+
+**Full Changelog**: https://github.com/Yornik/dirigera-exporter/compare/v0.6.0...v0.6.1
+
 ## 0.6.0 (2026-11-17)
 
 ## What's Changed
